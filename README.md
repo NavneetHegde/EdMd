@@ -82,9 +82,16 @@ open/save). Serve it locally:
 pwsh -File src/EdMd/serve.ps1     # http://localhost:8080, opens Chrome
 ```
 
+## Contributing
+
+Pull requests welcome — branch, run `dotnet test`, open a PR against `main` (CI must pass).
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full workflow and the guardrails that keep
+the app safe.
+
 ## Releasing (maintainers)
 
-Push a version tag; CI does the rest:
+Releases are tag-driven — full process and versioning policy in [`RELEASING.md`](RELEASING.md).
+In short, push a version tag and CI does the rest:
 
 ```powershell
 git tag v1.2.3 && git push origin v1.2.3
