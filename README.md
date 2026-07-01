@@ -11,6 +11,10 @@ skills, `CLAUDE.md` files, PRs, and specs — with a live token/word/char counte
 
 > <img width="2372" height="1594" alt="image" src="https://github.com/user-attachments/assets/fb7037b6-ec99-43e4-8d05-b82c704ada97" />
 
+In Browser
+
+> <img width="1800" height="1900" alt="image" src="https://github.com/user-attachments/assets/cd83a7c7-304f-4a1a-90d0-58b26afa934e" />
+
 
 ## Install
 
