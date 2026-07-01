@@ -1,7 +1,6 @@
 # EdMd — a native Windows Markdown editor
 
-<!-- Update <OWNER> once the GitHub repo exists. -->
-[![CI](https://github.com/OWNER/EdMd/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/EdMd/actions/workflows/ci.yml)
+[![CI](https://github.com/NavneetHegde/EdMd/actions/workflows/ci.yml/badge.svg)](https://github.com/NavneetHegde/EdMd/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 EdMd is a small, fast **WYSIWYG Markdown editor** for Windows. It's a WPF window hosting a
