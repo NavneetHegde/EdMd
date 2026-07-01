@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    # Windows-only: WPF + WebView2. The tests themselves (LocalWebServer, AtomicFile)
+    # are pure C# and need no WebView2 runtime.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Restore
+        run: dotnet restore EdMd.slnx
+
+      - name: Build
+        run: dotnet build EdMd.slnx -c Release --no-restore
+
+      - name: Test
+        run: dotnet test EdMd.slnx -c Release --no-build

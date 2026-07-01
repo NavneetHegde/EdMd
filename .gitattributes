@@ -1,0 +1,13 @@
+# Normalize text files to LF in the repo; Git checks out native line endings per OS.
+* text=auto
+
+# Binary assets — never apply line-ending conversion.
+*.ico  binary
+*.cer  binary
+*.pfx  binary
+*.png  binary
+*.jpg  binary
+*.gif  binary
+*.woff  binary
+*.woff2 binary
+*.ttf  binary

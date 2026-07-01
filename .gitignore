@@ -1,0 +1,24 @@
+# ---- Build output ----
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+**/Output/
+**/obj/stage/
+[Pp]ublish/
+dist/
+
+# ---- Visual Studio / Rider / VS Code ----
+.vs/
+.idea/
+*.user
+*.suo
+*.binlog
+
+# ---- Code-signing PRIVATE KEYS — never commit ----
+# The public certificate (certs/*.cer) IS tracked on purpose: users need it for the
+# interim self-signed trust step. Only the private key (.pfx) must stay out of git.
+*.pfx
+
+# ---- OS cruft ----
+Thumbs.db
+.DS_Store

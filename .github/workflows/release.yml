@@ -1,0 +1,118 @@
+name: Release
+
+# Fires on a version tag (vX.Y.Z) to build, sign, and publish a GitHub Release.
+# workflow_dispatch runs a dry build (artifacts uploaded to the run, no Release created).
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version for a manual dry-run build (e.g. 0.0.1)'
+        required: true
+        default: '0.0.1'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      # Repo variable toggles the signing branch: 'selfsigned' (interim) or 'signpath'.
+      # Defaults to self-signed until SignPath Foundation onboarding is complete.
+      SIGNING_MODE: ${{ vars.SIGNING_MODE || 'selfsigned' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # Derive both the semver (X.Y.Z, for filenames) and the 4-part MSIX version (X.Y.Z.0).
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "semver=$V"   >> "$GITHUB_OUTPUT"
+          echo "msix=$V.0"   >> "$GITHUB_OUTPUT"
+
+      - name: Restore & test (gate the release on green tests)
+        run: |
+          dotnet restore EdMd.slnx
+          dotnet test EdMd.slnx -c Release
+
+      # ---- Portable self-contained single-file exe ----
+      - name: Publish portable exe
+        shell: pwsh
+        run: |
+          dotnet publish src/EdMd/EdMd.csproj -c Release -r win-x64 --self-contained true `
+            -p:PublishSingleFile=true -p:Version=${{ steps.ver.outputs.msix }} -o publish/exe
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item publish/exe/EdMd.exe "dist/EdMd-${{ steps.ver.outputs.semver }}-win-x64.exe"
+
+      # ---- MSIX (interim): sign with the committed self-signed cert via a secret ----
+      # Reuses the installer's production path. Users trust certs/edmd-codesign.cer once;
+      # that step disappears when SIGNING_MODE flips to 'signpath'.
+      - name: Build & self-sign MSIX
+        if: env.SIGNING_MODE != 'signpath'
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.SELFSIGN_PFX_BASE64 }}
+          PFX_PWD: ${{ secrets.SELFSIGN_PFX_PASSWORD }}
+        run: |
+          if (-not $env:PFX_B64) { throw "SELFSIGN_PFX_BASE64 secret is not set." }
+          $pfx = Join-Path $env:RUNNER_TEMP 'edmd-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
+          ./src/EdMd.Installer/build.ps1 -PfxPath $pfx -PfxPassword $env:PFX_PWD -Version ${{ steps.ver.outputs.msix }}
+          Remove-Item $pfx -Force
+          Copy-Item "src/EdMd.Installer/Output/EdMd-${{ steps.ver.outputs.msix }}.msix" dist/
+          Copy-Item certs/edmd-codesign.cer dist/   # so users can trust the interim cert
+
+      # ---- MSIX (target): build unsigned, then sign with SignPath ----
+      # Publisher MUST equal the SignPath certificate Subject (repo var SIGNPATH_PUBLISHER).
+      - name: Build unsigned MSIX
+        if: env.SIGNING_MODE == 'signpath'
+        shell: pwsh
+        run: |
+          ./src/EdMd.Installer/build.ps1 -Version ${{ steps.ver.outputs.msix }} -Publisher "${{ vars.SIGNPATH_PUBLISHER }}"
+          Copy-Item "src/EdMd.Installer/Output/EdMd-${{ steps.ver.outputs.msix }}.msix" dist/
+
+      # NOTE (cutover): finalize the input names + artifact-configuration slug against your
+      # SignPath project (https://docs.signpath.io/trusted-build-systems/github). The
+      # project needs an artifact configuration that signs the .msix (and optionally the .exe).
+      - name: Sign with SignPath
+        if: env.SIGNING_MODE == 'signpath'
+        uses: SignPath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORG_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          artifact-configuration-slug: msix
+          wait-for-completion: true
+          output-artifact-directory: dist
+
+      # ---- Publish ----
+      - name: Create GitHub Release (tag builds only)
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+      - name: Upload dry-run artifacts (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: edmd-${{ steps.ver.outputs.semver }}
+          path: dist/*

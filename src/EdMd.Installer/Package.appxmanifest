@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap3 rescap">
+
+  <!-- Publisher is a PLACEHOLDER: build.ps1 overwrites it at pack time with the Subject
+       of the signing certificate (from -PfxPath), because Identity/Publisher MUST match
+       the cert exactly or Windows refuses to install. Version is likewise injected.
+       Name is the stable package family identity — for Microsoft Store distribution set
+       it to the value reserved in Partner Center. -->
+  <Identity Name="EdMd.MarkdownEditor"
+            Publisher="CN=EdMd Dev"
+            Version="1.0.0.0"
+            ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>EdMd</DisplayName>
+    <PublisherDisplayName>EdMd</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <Description>A native Windows Markdown editor.</Description>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <!-- EntryPoint=Windows.FullTrustApplication runs the packaged WPF exe with full
+         desktop trust (needed to read/write arbitrary .md files the user opens). -->
+    <Application Id="EdMd" Executable="EdMd.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="EdMd"
+        Description="A native Windows Markdown editor."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
+      </uap:VisualElements>
+
+      <Extensions>
+        <!-- Double-click / "Open with" for .md and .markdown. The file path is passed
+             on the command line as "%1"; MainWindow scans GetCommandLineArgs() for it. -->
+        <uap3:Extension Category="windows.fileTypeAssociation">
+          <uap3:FileTypeAssociation Name="markdown" Parameters="&quot;%1&quot;">
+            <uap:DisplayName>Markdown Document</uap:DisplayName>
+            <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
+            <uap:SupportedFileTypes>
+              <uap:FileType>.md</uap:FileType>
+              <uap:FileType>.markdown</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap3:FileTypeAssociation>
+        </uap3:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

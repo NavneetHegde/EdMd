@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/EdMd/EdMd.csproj" />
+  <Project Path="src/EdMd.Tests/EdMd.Tests.csproj" />
+</Solution>
