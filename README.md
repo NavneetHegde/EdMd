@@ -9,11 +9,11 @@ single WebView2 that renders the whole UI (toolbar, editor, footer) as HTML/CSS/
 the window and the disk I/O the browser sandbox can't do. Built for authoring prompts,
 skills, `CLAUDE.md` files, PRs, and specs — with a live token/word/char counter.
 
-> <img width="2372" height="1594" alt="image" src="https://github.com/user-attachments/assets/fb7037b6-ec99-43e4-8d05-b82c704ada97" />
+> <img width="1910" height="1027" alt="image" src="https://github.com/user-attachments/assets/7e83a1d1-f74e-4280-812f-eca0e911b663" />
 
 In Browser
 
-> <img width="1800" height="1900" alt="image" src="https://github.com/user-attachments/assets/cd83a7c7-304f-4a1a-90d0-58b26afa934e" />
+<img width="1319" height="1027" alt="image" src="https://github.com/user-attachments/assets/ab383186-012b-426d-94fb-82afb737be06" />
 
 
 ## Install
