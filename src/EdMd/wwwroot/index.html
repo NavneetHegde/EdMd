@@ -203,7 +203,13 @@
   ::highlight(find-match){background:rgba(255,214,0,.32);color:inherit;}
   ::highlight(find-current){background:#ff9d2e;color:#000;}
 
-  /* Themed scrollbars (Chromium/WebView2) — flip with light/dark via the variables. */
+  /* Themed scrollbars (Chromium/WebView2) — flip with light/dark via the variables.
+     cursor:default keeps the normal arrow over the bar; without it the editor's
+     contenteditable text I-beam bleeds onto its own scrollbar. */
+  *::-webkit-scrollbar,
+  *::-webkit-scrollbar-track,
+  *::-webkit-scrollbar-thumb,
+  *::-webkit-scrollbar-corner{cursor:default;}
   *::-webkit-scrollbar{width:12px;height:12px;}
   *::-webkit-scrollbar-track{background:var(--panel);}
   *::-webkit-scrollbar-thumb{background:var(--border);border-radius:7px;border:3px solid var(--panel);}
