@@ -28,6 +28,11 @@ public partial class MainWindow : Window
     // remember the original and restore it on save; defaults to '\n' for a fresh document.
     private string _openedNewline = "\n";
 
+    // Last-write timestamp of the open file when we last read or wrote it. Used to detect that
+    // another application changed the file on disk before we overwrite it, so we can warn rather
+    // than silently clobber the external edit. Null for a never-saved (new) document.
+    private DateTime? _openedFileWriteTimeUtc;
+
     // Dirty state is mirrored from the JS editor (it owns the document); the C# side needs
     // it to guard the window-close path. _forceClose/_closePending drive the save-then-close
     // handshake (see MainWindow_Closing / HandleSaveResult).
@@ -474,6 +479,7 @@ public partial class MainWindow : Window
         }
 
         _openedFilePath = dlg.FileName;
+        _openedFileWriteTimeUtc = TryGetWriteTimeUtc(dlg.FileName);
         Title = $"{Path.GetFileName(dlg.FileName)} — EdMd";
         _ = PostToJs(new { type = "saved", name = Path.GetFileName(dlg.FileName), path = dlg.FileName });
         return true;
@@ -481,6 +487,27 @@ public partial class MainWindow : Window
 
     private async System.Threading.Tasks.Task<bool> SaveToPath(string path, string content)
     {
+        // Guard against clobbering an external edit: if the file's on-disk timestamp changed
+        // since we last read/wrote it, another app has modified it. Ask before overwriting.
+        // (A file that vanished — current == null — has nothing to lose, so we just recreate it.)
+        if (_openedFileWriteTimeUtc is DateTime known &&
+            TryGetWriteTimeUtc(path) is DateTime current && current != known)
+        {
+            var choice = MessageBox.Show(this,
+                $"\"{Path.GetFileName(path)}\" has been changed on disk by another program " +
+                "since you opened it.\n\n" +
+                "Yes — overwrite it with your version\n" +
+                "No — save your version under a new name\n" +
+                "Cancel — keep editing without saving",
+                "EdMd — file changed on disk", MessageBoxButton.YesNoCancel, MessageBoxImage.Warning);
+
+            if (choice == MessageBoxResult.Cancel)
+                return false;
+            if (choice == MessageBoxResult.No)
+                return SaveAs(content);
+            // Yes — fall through and overwrite the external changes.
+        }
+
         try
         {
             AtomicFile.WriteAllText(path, AtomicFile.NormalizeNewlines(content, _openedNewline), _openedEncoding);
@@ -491,8 +518,17 @@ public partial class MainWindow : Window
             return false;
         }
 
+        _openedFileWriteTimeUtc = TryGetWriteTimeUtc(path);
         await PostToJs(new { type = "saved", name = Path.GetFileName(path), path });
         return true;
+    }
+
+    // The file's current last-write time in UTC, or null if it's missing/unreadable. Used as the
+    // baseline for detecting an external edit before an overwrite.
+    private static DateTime? TryGetWriteTimeUtc(string path)
+    {
+        try { return File.Exists(path) ? File.GetLastWriteTimeUtc(path) : null; }
+        catch { return null; }
     }
 
     private async System.Threading.Tasks.Task OpenFileIntoEditor(string path)
@@ -515,6 +551,7 @@ public partial class MainWindow : Window
         _openedNewline = AtomicFile.DetectNewline(content);
 
         _openedFilePath = path;
+        _openedFileWriteTimeUtc = TryGetWriteTimeUtc(path);
         Title = $"{Path.GetFileName(path)} — EdMd";
         await PostToJs(new { type = "fileOpened", name = Path.GetFileName(path), content, path });
     }
