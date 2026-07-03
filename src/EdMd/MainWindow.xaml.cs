@@ -282,6 +282,12 @@ public partial class MainWindow : Window
                     _isDirty = msg.TryGetProperty("value", out var dv) && dv.ValueKind == JsonValueKind.True;
                     break;
 
+                case "reset":
+                    // "New file" in the UI: forget the currently-open path so the next Save
+                    // prompts for a new file (Save As) instead of overwriting the last file.
+                    _openedFilePath = null;
+                    break;
+
                 case "openInBrowser":
                     {
                         string markdown = msg.TryGetProperty("markdown", out var mdp) && mdp.ValueKind == JsonValueKind.String

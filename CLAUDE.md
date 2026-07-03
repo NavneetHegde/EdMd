@@ -160,5 +160,6 @@ the browser never exposes a file's full path (so the footer shows the name there
   requires a rebuild/re-run to see changes in the packaged app (`dotnet run` handles
   this).
 - The mode switch (raw-markdown tab) is deliberately hidden — Toast is locked to
-  WYSIWYG via `hideModeSwitch: true` plus a CSS rule. Zoom and theme are
-  browser-side only (persisted in `localStorage`), invisible to C#.
+  WYSIWYG via `hideModeSwitch: true` plus a CSS rule. Zoom, theme, and reading width
+  (the centered-column control, via the `--read-col` CSS var) are browser-side only
+  (persisted in `localStorage`), invisible to C#.
