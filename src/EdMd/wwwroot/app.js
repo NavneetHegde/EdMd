@@ -57,8 +57,24 @@ editor.on('change', ()=>{ updateWordCount(); setDirty(true); });
 const IS_DESKTOP = !!(window.chrome && window.chrome.webview);
 
 // Shared UI updates, driven by whichever host loaded/saved the file.
+// Clear the editor's undo history so the just-loaded document is the baseline. Without
+// this, editor.setMarkdown() records the load as one undoable transaction on top of the
+// empty starting doc, so the user's first Ctrl+Z wipes the whole file back to blank.
+// Recreating the EditorState reinitialises all plugin state (incl. prosemirror-history)
+// while keeping the current doc/plugins/selection — the standard ProseMirror recipe.
+function resetUndoHistory(){
+  try{
+    const view = editor.getCurrentModeEditor().view;
+    view.updateState(view.state.constructor.create({
+      doc: view.state.doc,
+      plugins: view.state.plugins,
+      selection: view.state.selection,
+    }));
+  }catch(_){ /* Toast internals moved; skip (undo just isn't reset) */ }
+}
 function applyOpenedFile(name, content, path){
   editor.setMarkdown(content, false);
+  resetUndoHistory();
   updateWordCount();
   setFileName(name); setFilePath(path || name); setDirty(false);
   setStatus('Opened ' + name);
@@ -85,7 +101,7 @@ if(IS_DESKTOP){
     // browserId (optional) is an Id from the C#-supplied list; omitted = let C# auto-pick.
     openInBrowser: (browserId)=>{ send({type:'openInBrowser', markdown: editor.getMarkdown(), browserId: browserId || ''}); setStatus('Opening in browser…'); },
     dirtyChanged: (v)=> send({type:'dirty', value: !!v}),
-    reset: ()=>{},
+    reset: ()=> send({type:'reset'}),
   };
 } else {
   // Chromium (Chrome/Edge): real local open/save via the File System Access API.
@@ -184,9 +200,14 @@ function populateBrowserMenu(list){
   caret.style.display = '';
 }
 
+// "New" starts a fresh, untitled document: it blanks the editor AND detaches from the
+// currently-open file (clearing the name/path and the file handle). This is what stops a
+// later Save from overwriting the last-opened file — with no handle, Save falls through
+// to Save As and asks where to write the new file.
 document.getElementById('btnNew').addEventListener('click', ()=>{
   if(isDirty && !confirm('Discard unsaved changes and start a new file?')) return;
   editor.setMarkdown('', false);
+  resetUndoHistory();
   updateWordCount(); setFileName(null); setFilePath(null); setDirty(false);
   host.reset();
   setStatus('New file');
@@ -227,6 +248,29 @@ document.getElementById('editorHost').addEventListener('wheel', (e)=>{
   setZoom(zoom + (e.deltaY < 0 ? 10 : -10));
 }, { passive:false });
 
+// ---- Reading width (centered column via the --read-col CSS var; browser-side only) ----
+// Constrains line length for readability. 'full' = 100% collapses back to full-width.
+const WIDTHS = [
+  { id:'narrow',  name:'📖 Narrow',      col:'38rem' },
+  { id:'comfort', name:'📗 Comfortable', col:'46rem' },  // default (~72ch)
+  { id:'wide',    name:'📚 Wide',        col:'58rem' },
+  { id:'full',    name:'🖥️ Full width',  col:'100%'  },
+];
+const widthSelect = document.getElementById('widthSelect');
+for(const w of WIDTHS){
+  const o = document.createElement('option');
+  o.value = w.id; o.textContent = w.name;
+  widthSelect.appendChild(o);
+}
+function applyWidth(id){
+  const w = WIDTHS.find(x => x.id === id) || WIDTHS[1];
+  document.documentElement.style.setProperty('--read-col', w.col);
+  widthSelect.value = w.id;
+  localStorage.setItem('EdMd-width', w.id);
+}
+widthSelect.addEventListener('change', ()=> applyWidth(widthSelect.value));
+applyWidth(localStorage.getItem('EdMd-width') || 'comfort');
+
 // ---- Themes ----
 // Each entry maps to a body[data-theme="id"] palette in the CSS above. `dark` picks
 // which Toast editor skin (its dark stylesheet class) to apply for good contrast.
@@ -239,6 +283,10 @@ const THEMES = [
   { id:'gruvbox',   name:'🍂 Gruvbox',         dark:true  },
   { id:'solarized', name:'🌞 Solarized Light', dark:false },
   { id:'prism',     name:'🎨 Prism',           dark:true  },
+  { id:'aurora',    name:'🌌 Aurora',          dark:true  },
+  { id:'sunset',    name:'🌇 Sunset',          dark:true  },
+  { id:'blossom',   name:'🌸 Blossom',         dark:false },
+  { id:'citrus',    name:'🍋 Citrus',          dark:false },
 ];
 const themeSelect = document.getElementById('themeSelect');
 for(const t of THEMES){
@@ -309,54 +357,207 @@ function applyMode(mode){
 btnRaw.addEventListener('click', ()=> applyMode(editMode === 'markdown' ? 'wysiwyg' : 'markdown'));
 applyMode(editMode);
 
-// ---- Find / Replace (operates on the markdown source; works in both modes) ----
+// ---- Find / Replace ----
+// Matches are highlighted directly in the visible editing surface via the CSS Custom
+// Highlight API (Chromium-only, which is all WebView2/Chrome/Edge). It paints Ranges
+// without mutating the DOM, so it never disturbs Toast/ProseMirror. Highlighting reads
+// the rendered text (WYSIWYG shows prose, raw mode shows the markdown source), and
+// Replace all edits those same rendered matches so it stays consistent with the count.
 const findBar      = document.getElementById('findBar');
 const findInput    = document.getElementById('findInput');
 const replaceInput = document.getElementById('replaceInput');
 const findCount    = document.getElementById('findCount');
 let findCase = false, findRegex = false;
 
-function findPattern(){
+const HL_OK = !!(window.CSS && CSS.highlights && window.Highlight);
+const matchHi   = HL_OK ? new Highlight() : null;
+const currentHi = HL_OK ? new Highlight() : null;
+if(HL_OK){
+  CSS.highlights.set('find-match', matchHi);
+  CSS.highlights.set('find-current', currentHi);
+  currentHi.priority = 1;            // the active match wins where the two overlap
+}
+let matchRanges = [];
+let currentMatch = -1;
+let suppressFindRefresh = false;  // set during a batch replace so each edit doesn't re-scan
+
+// The regex source for the current query (query escaped unless regex mode is on).
+// null = empty query, 'error' = invalid regex.
+function findSource(){
   const q = findInput.value;
   if(!q) return null;
-  let flags = 'g'; if(!findCase) flags += 'i';
-  try{
-    const src = findRegex ? q : q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return new RegExp(src, flags);
-  }catch(e){ return 'error'; }
+  const src = findRegex ? q : q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  try{ new RegExp(src); return src; }catch(e){ return 'error'; }
 }
-function updateFindCount(){
+function findPattern(){
+  const src = findSource();
+  if(!src || src === 'error') return src;
+  return new RegExp(src, findCase ? 'g' : 'gi');
+}
+// The editable surface of whichever mode (WYSIWYG / raw) is currently shown.
+function visibleEditorRoot(){
+  const roots = document.querySelectorAll('#editorHost .ProseMirror');
+  for(const r of roots){ if(r.offsetParent !== null || r.getClientRects().length) return r; }
+  return roots[0] || null;
+}
+function locateOffset(map, offset){
+  let lo = 0, hi = map.length - 1, res = 0;
+  while(lo <= hi){ const mid = (lo + hi) >> 1; if(map[mid].start <= offset){ res = mid; lo = mid + 1; } else hi = mid - 1; }
+  return { node: map[res].node, offset: offset - map[res].start };
+}
+// Flatten a root's text nodes into one string plus a {node,start} map so a match offset
+// in the string can be mapped back to a DOM position (see locateOffset). Used for both
+// highlighting and DOM-range replace, so the two always see the same text.
+function domTextAndMap(root){
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  let text = ''; const map = []; let n;
+  while((n = walker.nextNode())){ map.push({ node: n, start: text.length }); text += n.data; }
+  return { text, map };
+}
+function rangeFromOffsets(map, s, e){
+  const a = locateOffset(map, s), b = locateOffset(map, e);
+  const r = document.createRange();
+  r.setStart(a.node, a.offset); r.setEnd(b.node, b.offset);
+  return r;
+}
+function clearHighlights(){
+  if(HL_OK){ matchHi.clear(); currentHi.clear(); }
+  matchRanges = []; currentMatch = -1;
+}
+// Rebuild the set of match ranges from the live DOM. keepIndex keeps the caret on the
+// same match number where possible (e.g. after toggling case), else jumps to the first.
+function refreshMatches(keepIndex){
+  const prev = currentMatch;
+  clearHighlights();
   const re = findPattern();
+  if(!HL_OK || !re || re === 'error'){ updateFindCount(re); return; }
+  const root = visibleEditorRoot();
+  if(!root){ updateFindCount(re); return; }
+  const { text, map } = domTextAndMap(root);
+  if(!map.length){ updateFindCount(re); return; }
+  re.lastIndex = 0;
+  let m;
+  while((m = re.exec(text))){
+    if(m[0].length === 0){ re.lastIndex++; continue; }   // guard against zero-width matches
+    try{
+      const r = rangeFromOffsets(map, m.index, m.index + m[0].length);
+      matchRanges.push(r); matchHi.add(r);
+    }catch(_){ /* skip a range the DOM won't accept */ }
+  }
+  if(matchRanges.length){
+    const idx = keepIndex && prev >= 0 ? Math.min(prev, matchRanges.length - 1) : 0;
+    setCurrent(idx, false);
+  } else {
+    updateFindCount(re);
+  }
+}
+function setCurrent(idx, scroll){
+  if(!HL_OK) return;
+  currentHi.clear();
+  if(idx < 0 || idx >= matchRanges.length){ currentMatch = -1; updateFindCount(); return; }
+  currentMatch = idx;
+  const r = matchRanges[idx];
+  currentHi.add(r);
+  if(scroll){ const host = r.startContainer.parentElement; if(host) host.scrollIntoView({ block: 'center' }); }
+  updateFindCount();
+}
+function stepMatch(dir){
+  if(!matchRanges.length){ refreshMatches(true); if(!matchRanges.length) return; }
+  let idx = currentMatch + dir;
+  if(idx < 0) idx = matchRanges.length - 1;
+  if(idx >= matchRanges.length) idx = 0;
+  setCurrent(idx, true);
+}
+function updateFindCount(re){
+  if(re === undefined) re = findPattern();
   if(re === 'error'){ findCount.textContent = 'bad regex'; return; }
   if(!re){ findCount.textContent = ''; return; }
-  const m = editor.getMarkdown().match(re);
-  findCount.textContent = (m ? m.length : 0) + ' matches';
+  if(!HL_OK){
+    // No CSS Custom Highlight API (non-Chromium): we can't paint/navigate ranges, but
+    // still report a count so Find stays useful. Count over the markdown source.
+    const m = editor.getMarkdown().match(re);
+    findCount.textContent = (m ? m.length : 0) + ' matches';
+    return;
+  }
+  findCount.textContent = matchRanges.length
+    ? (currentMatch + 1) + ' of ' + matchRanges.length
+    : 'No results';
 }
+// Replace all matches. On Chromium we edit the same DOM-derived matches that are
+// highlighted/counted, so what gets replaced always equals what the user sees. Each
+// match is written through execCommand('insertText'), which ProseMirror handles as a
+// normal edit (keeping its model + the markdown in sync). Matches are re-derived from
+// the live DOM after every edit — ProseMirror re-renders can detach earlier ranges — and
+// a text-offset cursor advances past each insertion so a replacement that itself contains
+// the query can't loop forever. Non-Chromium (no highlight ranges) falls back to a plain
+// markdown-source replace.
 function replaceAll(){
-  const re = findPattern();
-  if(!re || re === 'error') return;
-  const md = editor.getMarkdown();
-  const out = md.replace(re, replaceInput.value);
-  if(out !== md){ editor.setMarkdown(out, false); updateWordCount(); setDirty(true); setStatus('Replaced all'); }
+  const src = findSource();
+  if(!src || src === 'error') return;
+  if(!HL_OK){
+    const re = new RegExp(src, findCase ? 'g' : 'gi');
+    const md = editor.getMarkdown();
+    const out = md.replace(re, replaceInput.value);
+    if(out !== md){ editor.setMarkdown(out, false); updateWordCount(); setDirty(true); setStatus('Replaced all'); }
+    else setStatus('No matches');
+    updateFindCount();
+    return;
+  }
+  const editRoot = visibleEditorRoot();
+  if(!editRoot){ setStatus('No matches'); return; }
+  if(editRoot.focus) editRoot.focus();            // execCommand targets the focused editable
+  const flags = findCase ? '' : 'i';
+  const reOne = new RegExp(src, flags);           // non-global: expands $& / $1 per match
+  const sel = window.getSelection();
+  let cursor = 0, replaced = 0, guard = 100000;
+  suppressFindRefresh = true;
+  try{
+    while(guard-- > 0){
+      const root = visibleEditorRoot();
+      if(!root) break;
+      const { text, map } = domTextAndMap(root);
+      const reG = new RegExp(src, 'g' + flags);
+      reG.lastIndex = cursor;
+      const m = reG.exec(text);
+      if(!m) break;
+      if(m[0].length === 0){ cursor = m.index + 1; continue; }   // skip zero-width matches
+      let range;
+      try{ range = rangeFromOffsets(map, m.index, m.index + m[0].length); }
+      catch(_){ cursor = m.index + m[0].length; continue; }
+      const replacement = m[0].replace(reOne, replaceInput.value);
+      sel.removeAllRanges(); sel.addRange(range);
+      if(!document.execCommand('insertText', false, replacement)) break;
+      replaced++;
+      cursor = m.index + replacement.length;       // step past the inserted text
+    }
+  } finally { suppressFindRefresh = false; }
+  if(replaced){ updateWordCount(); setDirty(true); setStatus('Replaced ' + replaced); }
   else setStatus('No matches');
-  updateFindCount();
+  findInput.focus();
+  refreshMatches(false);
 }
 function openFind(withReplace){
   findBar.style.display = 'flex';
   replaceInput.style.display = withReplace ? '' : 'none';
   document.getElementById('findReplaceAll').style.display = withReplace ? '' : 'none';
   findInput.focus(); findInput.select();
-  updateFindCount();
+  refreshMatches(false);
 }
-function closeFind(){ findBar.style.display = 'none'; }
-findInput.addEventListener('input', updateFindCount);
-findInput.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); if(replaceInput.style.display!=='none') replaceAll(); } });
+function closeFind(){ findBar.style.display = 'none'; clearHighlights(); }
+findInput.addEventListener('input', ()=> refreshMatches(false));
+findInput.addEventListener('keydown', (e)=>{
+  if(e.key === 'Enter'){ e.preventDefault(); stepMatch(e.shiftKey ? -1 : 1); }
+});
 replaceInput.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); replaceAll(); } });
 document.getElementById('findReplaceAll').addEventListener('click', replaceAll);
 document.getElementById('findClose').addEventListener('click', closeFind);
+document.getElementById('findPrev').addEventListener('click', ()=> stepMatch(-1));
+document.getElementById('findNext').addEventListener('click', ()=> stepMatch(1));
 document.getElementById('btnFind').addEventListener('click', ()=> openFind(true));
-document.getElementById('findCase').addEventListener('click', (e)=>{ findCase = !findCase; e.currentTarget.classList.toggle('active', findCase); updateFindCount(); });
-document.getElementById('findRegex').addEventListener('click', (e)=>{ findRegex = !findRegex; e.currentTarget.classList.toggle('active', findRegex); updateFindCount(); });
+document.getElementById('findCase').addEventListener('click', (e)=>{ findCase = !findCase; e.currentTarget.classList.toggle('active', findCase); refreshMatches(true); });
+document.getElementById('findRegex').addEventListener('click', (e)=>{ findRegex = !findRegex; e.currentTarget.classList.toggle('active', findRegex); refreshMatches(true); });
+// Keep highlights in sync while the doc changes with the find bar open.
+editor.on('change', ()=>{ if(!suppressFindRefresh && findBar.style.display !== 'none') refreshMatches(true); });
 
 // ---- Templates (offline scaffolds) ----
 const TEMPLATES = {
@@ -427,6 +628,7 @@ function loadTemplate(key){
   if(tpl == null) return;
   if(isDirty && !confirm('Discard unsaved changes and start from this template?')) return;
   editor.setMarkdown(tpl, false);
+  resetUndoHistory();
   updateWordCount(); setFileName(null); setFilePath(null); setDirty(false);
   host.reset();
   setStatus('New from ' + key + ' template');
