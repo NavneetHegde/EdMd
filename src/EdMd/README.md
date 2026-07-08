@@ -80,8 +80,13 @@ find `EdMd.exe` (Browse to the published exe if not listed) → "Always use this
 
 ## Notes
 
-- **Unsaved changes** are guarded: closing the window (or opening/New) with pending
-  edits prompts before discarding. Save/open/write failures show a message instead of
+- **Multi-file tabs / single instance:** each open file gets its own tab (New/Open/templates
+  never clobber an existing document — they open or reuse a tab). A second launch (double-click,
+  "Open with", or re-running the exe) forwards its files to the already-running window as new
+  tabs and brings it to front, rather than opening a duplicate app.
+- **Unsaved changes** are guarded: closing the window with pending edits prompts to save every
+  dirty tab first; closing a single dirty tab (× / middle-click / Ctrl+W) prompts before
+  discarding just that tab. Save/open/write failures show a message instead of
   crashing, and details are logged to `%LOCALAPPDATA%\EdMd\logs\edmd-<date>.log`
   (useful for support). If the WebView2 runtime is missing, EdMd explains how to install
   it rather than crashing on launch.

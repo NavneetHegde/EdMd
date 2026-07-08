@@ -32,7 +32,8 @@ as an in-place upgrade if the version increases *and* it's signed by the same pu
    ```
 3. That's it. `release.yml` runs on the tag and:
    - runs the tests (a red test **blocks** the release),
-   - publishes the portable single-file exe `EdMd-<ver>-win-x64.exe`,
+   - publishes the portable single-file exe `EdMd-<ver>-win-x64.exe` and a zipped copy
+     `EdMd-<ver>-win-x64.zip` (the exe + `LICENSE.txt`),
    - builds the MSIX via `src/EdMd.Installer/build.ps1`, **signs** it, and
    - creates a **GitHub Release** for the tag with the assets + auto-generated notes.
 
@@ -69,6 +70,6 @@ Once the [SignPath Foundation](https://signpath.org) application is approved:
 
 ## After publishing
 
-- Check the [release page](https://github.com/NavneetHegde/EdMd/releases) has all three
-  assets (`.exe`, `.msix`, and — in `selfsigned` mode — `.cer`).
+- Check the [release page](https://github.com/NavneetHegde/EdMd/releases) has all the
+  assets (`.exe`, `.zip`, `.msix`, and — in `selfsigned` mode — `.cer`).
 - Smoke-test an upgrade: `Add-AppxPackage EdMd-<newver>.msix` over a previous install.

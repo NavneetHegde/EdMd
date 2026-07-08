@@ -4,10 +4,14 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 EdMd is a small, fast **WYSIWYG Markdown editor** for Windows. It's a WPF window hosting a
-single WebView2 that renders the whole UI (toolbar, editor, footer) as HTML/CSS/JS, with the
-[Toast UI Editor](https://ui.toast.com/tui-editor) doing the editing. The C# side only owns
-the window and the disk I/O the browser sandbox can't do. Built for authoring prompts,
+single WebView2 that renders the whole UI (tab strip, toolbar, editor, footer) as HTML/CSS/JS,
+with the [Toast UI Editor](https://ui.toast.com/tui-editor) doing the editing. The C# side only
+owns the window and the disk I/O the browser sandbox can't do. Built for authoring prompts,
 skills, `CLAUDE.md` files, PRs, and specs — with a live token/word/char counter.
+
+**Multi-file, single instance:** open several documents in tabs (Ctrl+T new, Ctrl+W close,
+middle-click to close, or open/select many files at once). Double-clicking a `.md` in Explorer
+opens it as a new tab in the running window instead of launching a second copy.
 
 > <img width="1910" height="1027" alt="image" src="https://github.com/user-attachments/assets/7e83a1d1-f74e-4280-812f-eca0e911b663" />
 
@@ -46,6 +50,10 @@ Add-AppxPackage .\EdMd-<version>.msix
 Download `EdMd-<version>-win-x64.exe` and run it. It's self-contained (no .NET needed).
 No file associations, and SmartScreen may show "Windows protected your PC" → **More info →
 Run anyway** until the download builds reputation.
+
+Prefer a zip? `EdMd-<version>-win-x64.zip` has the same portable exe plus `LICENSE.txt` —
+extract it anywhere and run `EdMd.exe`. A zipped download also sidesteps some browser/AV
+"can't download .exe" friction.
 
 ### Requirement: WebView2 Runtime
 

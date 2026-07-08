@@ -5,15 +5,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A native Windows Markdown editor: a WPF host window that hosts a single WebView2
-control filling the whole window. All UI (toolbar, editor, footer) is HTML/CSS/JS
+control filling the whole window. All UI (tab strip, toolbar, editor, footer) is HTML/CSS/JS
 rendered inside the WebView2; the C# side exists only to own the window and to do
 the disk I/O the browser sandbox can't. The editor itself is the third-party
 [Toast UI Editor](https://ui.toast.com/tui-editor) in WYSIWYG mode.
 
+It is **multi-tab / multi-file**: the whole document model (one Toast editor instance
+per open file, plus dirty state and which tab is active) lives in JS. C# stays
+stateless about tabs — it keeps only per-path save metadata (see the bridge section) and
+treats a JS-owned `tabId` as an opaque echo token on save round-trips. It is also
+**single-instance**: a second launch forwards its file arguments to the running window
+(new tabs) and exits, so every file opens in one app (see "Single instance" below).
+
 The core is a handful of small files: `MainWindow.xaml(.cs)`, `App.xaml(.cs)`,
-`wwwroot/index.html`, `LocalWebServer.cs` (a loopback HTTP server used only by the
-"Open in Browser" action — see the bridge section), and `Log.cs` (a dependency-free file
-logger). `App.xaml.cs` wires the global exception handlers.
+`wwwroot/index.html` + `wwwroot/app.js` (all the front-end logic), `LocalWebServer.cs`
+(a loopback HTTP server used only by the "Open in Browser" action — see the bridge
+section), and `Log.cs` (a dependency-free file logger). `App.xaml.cs` wires the global
+exception handlers **and** the single-instance mutex + named-pipe server.
 
 The same `index.html` also runs as a standalone web app in Chrome/Edge (no WPF host);
 `serve.ps1` hosts it on `http://localhost` for that. See "Dual-mode UI" below.
@@ -44,9 +52,10 @@ Tests live in `src/EdMd.Tests/` (xUnit) — run them with:
 dotnet test        # from src/EdMd.Tests/ or the repo root
 ```
 They cover the pure/security-sensitive C# logic: `LocalWebServer` (static file serving,
-MIME, 404/405, the `/__session` token gate, and path-traversal blocking) and `AtomicFile`
-(the temp-file+atomic-replace write). GUI/bridge code and the front-end JS are not
-covered. There is no linter or CI. `EdMd.slnx` at the repo root is the (XML) solution
+MIME, 404/405, the `/__session` token gate, and path-traversal blocking), `AtomicFile`
+(the temp-file+atomic-replace write), and `MarkdownFile` (the `.md`/`.markdown` extension
+gate for command-line opens and single-instance forwarding). GUI/bridge code (tabs,
+single-instance plumbing, the WebView2 bridge) and the front-end JS are not covered. There is no linter or CI. `EdMd.slnx` at the repo root is the (XML) solution
 file (now lists both projects). Note the project file is `EdMd.csproj` but `AssemblyName` is
 `EdMd`, so the built/published binary is **`EdMd.exe`** — installer and
 manifest references depend on that name; don't "fix" the mismatch.
@@ -78,27 +87,38 @@ HTTP server or other IPC. (`LocalWebServer` exists only for the browser handoff,
   to `index.html`. The editor UI is served from this fake origin, not from a file://
   path.
 - **JS → C# (`OnWebMessageReceived`):** the page sends `{type}` messages —
-  `open`, `save`, `saveAs` (the last two include `content`, the full markdown
-  string), `openInBrowser` (includes `markdown`), and `dirty` (mirrors the editor's
-  unsaved flag to C# so the close guard works). C# owns the
-  OpenFileDialog/SaveFileDialog and the actual `File.ReadAllText`/`WriteAllText`,
-  each wrapped so an I/O failure logs + reports rather than crashing. The
-  currently-open path is tracked in `_openedFilePath`; `save` with no path falls
-  through to Save As. `SaveAs`/`SaveToPath` return a **bool** (written vs
-  cancelled/failed), which drives the save-then-close handshake.
+  `open`, `save`/`saveAs` (both include `tabId`, `path`, `name`, and `content` — the full
+  markdown string), `openInBrowser` (includes `markdown` + the active tab's `name`/`path`),
+  `dirty` (mirrors an **aggregate** flag — true if *any* tab is unsaved — so the close guard
+  works), `tabClosed` (a `path`, so C# drops that file's cached save metadata), `theme`
+  (a `dark` bool, to match the native title bar — see Gotchas), and `readyToClose` (the
+  close handshake). C# owns the OpenFileDialog (now `Multiselect` — each file opens a
+  tab)/SaveFileDialog and the actual `File.ReadAllText`/`WriteAllText`, each wrapped so an
+  I/O failure logs + reports rather than crashing. **C# holds no "current file" —** instead
+  `_docs` maps each on-disk path to a `DocMeta` (encoding + line ending to round-trip, plus
+  the last-write timestamp for the external-change guard); untitled tabs use `DefaultMeta`.
+  `save` with an empty `path` falls through to Save As. `SaveAs`/`SaveToPath` report their
+  outcome to the tab (see `saved`/`saveResult` below) rather than returning a bool.
 - **C# → JS (`PostToJs`):** C# pushes `{type}` messages back —
-  `fileOpened` (name + content + full `path`), `saved` (name + full `path`),
-  `error` (a short message shown red in the footer), `requestSaveForClose` (asks
-  JS to save so the window can close), and `browsers` (the `{id,name}` list of Chromium
-  browsers found on this machine, sent once on load to fill the "Open in Browser"
-  dropdown). The JS `message` listener in `index.html`
-  reacts by calling `editor.setMarkdown(...)`, updating the filename label + footer
-  path, and clearing the dirty flag. (The footer shows the full path on the left and a
-  highlighted live `words · chars · lines` counter in the right corner.)
-- **Unsaved-changes guard:** `MainWindow_Closing` checks the mirrored `_isDirty`; on
-  a dirty close it prompts Save/Don't Save/Cancel. "Save" cancels the close, posts
-  `requestSaveForClose`, and `HandleSaveResult` re-closes (`_forceClose`) only after the
-  save succeeds. The JS `host.open()` (both hosts) `confirm()`s before discarding edits.
+  `fileOpened` (name + content + full `path` → opens/reuses a tab), `saved` (`tabId` +
+  name + full `path` — a successful write), `saveResult` (`tabId` + `ok:false` — a cancelled
+  dialog or failed write), `error` (a short message shown red in the footer),
+  `requestSaveForClose` (asks JS to save every dirty tab so the window can close), and
+  `browsers` (the `{id,name}` list of Chromium browsers found on this machine, sent once on
+  load to fill the "Open in Browser" dropdown). The JS `message` listener in `app.js` routes
+  `saved`/`saveResult` back to the originating tab by `tabId` (resolving that tab's pending
+  save promise) and updates the footer path + dirty dot. (The footer shows the full path on
+  the left and a highlighted live `~tokens · words · chars` counter in the right corner.)
+- **Save round-trips are promise-based:** each `save`/`saveAs` registers a resolver in a
+  JS `pendingSaves` map keyed by `tabId`; the matching `saved` (→ true) or `saveResult`
+  (→ false) resolves it. This lets the close handshake `await` every dirty tab's save.
+- **Unsaved-changes guard:** `MainWindow_Closing` checks the mirrored `_isAnyDirty`; on
+  a dirty close it prompts Save/Don't Save/Cancel. "Save" cancels the close and posts
+  `requestSaveForClose`; JS `saveAllForClose()` saves each dirty tab **in turn** (activating
+  it first so a Save As dialog is clearly for that file) and, only if all succeed, posts
+  `readyToClose` — which sets `_forceClose` and re-`Close()`s. Any cancelled save aborts the
+  close (JS simply never sends `readyToClose`). Per-tab close (chip ×, middle-click, Ctrl+W)
+  `confirm()`s in JS before discarding a dirty tab; the app never drops below one tab.
 - **Open in Browser (`openInBrowser` → `OpenInBrowserEditor`):** opens the *full*
   editor in Chrome, pre-loaded with the current document — not a static preview. C#
   lazily starts `LocalWebServer` (an in-process loopback `TcpListener` on an ephemeral
@@ -114,9 +134,18 @@ HTTP server or other IPC. (`LocalWebServer` exists only for the browser handoff,
   `browserId`, `FindChromiumBrowser` auto-picks (Chrome → Edge → Brave/Opera/Vivaldi, via
   App Paths → standard dirs) because open/save needs the File System Access API; only if
   none is found does it fall back to the OS default browser (open/save may be unavailable).
+  The handoff carries the *active* tab's markdown/name/path (C# no longer tracks one open doc).
 - **File associations / double-click:** `OnNavigationCompleted` scans
-  `Environment.GetCommandLineArgs()` for a `.md`/`.markdown` path and opens it once
-  the page is ready. This is why open-with works.
+  `Environment.GetCommandLineArgs()` for `.md`/`.markdown` paths and opens **each** into its
+  own tab once the page is ready. This is why open-with works.
+- **Single instance:** `App.OnStartup` grabs a named mutex (`Local\EdMd.SingleInstance.Mutex`).
+  The first instance owns it and runs a named-pipe server (`EdMd.SingleInstance.Pipe`); any
+  later launch finds the mutex held, connects to the pipe, writes its `.md` file args (one
+  per line), and exits. The server opens each forwarded path (`MainWindow.EnqueueOpenFile` →
+  queued until `_webReady`, then drained in `OnNavigationCompleted`) and calls `BringToFront`.
+  `MainWindow` is assigned **before** the pipe server starts so an immediate hand-off is never
+  dropped. JS de-dupes by path (`openInTab`), so forwarding an already-open file just focuses
+  its tab. Note `App.xaml` has no `StartupUri` — `OnStartup` creates the window itself.
 
 If you add a feature that crosses the boundary (e.g. a new toolbar action that
 touches disk), you must wire it in **both** places: add a message `type` in the JS
@@ -125,9 +154,10 @@ touches disk), you must wire it in **both** places: add a message `type` in the 
 **Dual-mode UI:** `index.html` runs in two hosts. It checks `IS_DESKTOP`
 (`window.chrome.webview` present) and builds a `host` object with `open/save/saveAs`:
 inside the WPF app those post bridge messages (above); in a plain browser they use the
-**File System Access API** (`showOpenFilePicker`/`showSaveFilePicker`). Both paths funnel
-through shared `applyOpenedFile`/`applySaved` UI helpers, so behaviour matches. Any new
-file action must be implemented on **both** host objects. Browser mode needs a secure
+**File System Access API** (`showOpenFilePicker`/`showSaveFilePicker`, both multi-select,
+so browser mode is multi-tab too — the handle is stashed on the tab record). Both paths
+funnel through the shared `openInTab`/`applySavedToTab` UI helpers, so behaviour matches.
+Any new file action must be implemented on **both** host objects. Browser mode needs a secure
 context (`http://localhost`), reached two ways: `serve.ps1` for the standalone web app,
 or `LocalWebServer` when the desktop app's "Open in Browser" hands a document off (adds
 the `?session=1` load path). The File System Access API is Chromium-only — in
@@ -159,7 +189,16 @@ the browser never exposes a file's full path (so the footer shows the name there
 - `wwwroot/**` is copied to output via `PreserveNewest`; editing `index.html`
   requires a rebuild/re-run to see changes in the packaged app (`dotnet run` handles
   this).
-- The mode switch (raw-markdown tab) is deliberately hidden — Toast is locked to
-  WYSIWYG via `hideModeSwitch: true` plus a CSS rule. Zoom, theme, and reading width
-  (the centered-column control, via the `--read-col` CSS var) are browser-side only
-  (persisted in `localStorage`), invisible to C#.
+- Toast's built-in mode switch is deliberately hidden (`hideModeSwitch: true` + a CSS
+  rule); the raw-markdown toggle, zoom, theme, and reading width (the centered-column
+  control, via the `--read-col` CSS var) are **global preferences** persisted in
+  `localStorage` and applied to *every* tab's editor (see `applyModeToEditor`/
+  `applyThemeToEditor`, called per-tab on creation and when the preference changes).
+- **Theme-aware title bar:** the theme's light/dark is the one preference that also reaches
+  C# — JS posts a `theme` message and `SetTitleBarDark` sets the DWM immersive-dark-mode
+  attribute so the native caption matches the editor. It uses attribute id 20 with a
+  fallback to the pre-20H1 id 19, and no-ops on unsupported builds.
+- **Tabs are JS-only.** The tab strip, per-tab Toast instances, active-tab tracking, and
+  dirty dots all live in `app.js`; C# only ever sees an aggregate dirty flag and per-path
+  `DocMeta`. A Save As that lands on a path another tab already has open is de-duped in JS
+  (`dedupeTabsByPath`) so two tabs can't share one path / one `_docs` entry.

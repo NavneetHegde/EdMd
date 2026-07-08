@@ -121,7 +121,31 @@
     border-radius:6px;padding:2px 9px;letter-spacing:.02em;}
   kbd{background:var(--panel-2);border:1px solid var(--border);border-bottom-width:2px;padding:1px 5px;border-radius:4px;font-family:var(--mono);font-size:10.5px;}
   main{flex:1;min-height:0;display:flex;}
-  #editorHost{flex:1;min-width:0;}
+  /* Holds one .tabEditor per open tab, stacked; only the active one is shown. Positioned so
+     each absolutely-filled editor gets a height (Toast's height:'100%' needs a sized parent). */
+  #editorHost{flex:1;min-width:0;position:relative;}
+  .tabEditor{position:absolute;inset:0;}
+  .tabEditor.inactive{display:none;}
+
+  /* Tab strip (below the toolbar, above the find bar) — one chip per open document. */
+  .tabstrip{display:flex;align-items:stretch;background:var(--panel-2);
+    border-bottom:1px solid var(--border);flex-shrink:0;}
+  .tablist{display:flex;align-items:stretch;overflow-x:auto;overflow-y:hidden;}
+  .tablist::-webkit-scrollbar{height:0;background:transparent;} /* keep the strip slim */
+  .tab{display:flex;align-items:center;gap:7px;padding:6px 10px;max-width:220px;
+    border-right:1px solid var(--border);cursor:pointer;font-family:var(--mono);font-size:12px;
+    color:var(--muted);white-space:nowrap;user-select:none;}
+  .tab:hover{background:var(--panel);}
+  .tab.active{background:var(--bg);color:var(--text);box-shadow:inset 0 -2px 0 var(--accent);}
+  .tab .tab-name{overflow:hidden;text-overflow:ellipsis;}
+  .tab .tab-dot{width:7px;height:7px;border-radius:50%;background:var(--amber);flex-shrink:0;display:none;}
+  .tab .tab-dot.show{display:inline-block;}
+  .tab .tab-close{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;
+    border-radius:4px;border:none;background:transparent;color:var(--muted);font-size:13px;padding:0;
+    line-height:1;flex-shrink:0;}
+  .tab .tab-close:hover{background:var(--border);color:var(--text);}
+  .newtab{border:none;border-radius:0;background:transparent;color:var(--muted);padding:6px 13px;font-size:16px;}
+  .newtab:hover{background:var(--panel);border-color:transparent;color:var(--text);}
   footer{padding:5px 14px;background:var(--panel);border-top:1px solid var(--border);font-family:var(--mono);font-size:13px;color:var(--muted);display:flex;justify-content:space-between;align-items:center;flex-shrink:0;}
   .footer-left{display:flex;align-items:center;gap:8px;min-width:0;margin-right:12px;}
   #filePath{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
@@ -219,7 +243,6 @@
 </head>
 <body>
     <header>
-        <div class="brand">EdMd</div>
         <button id="btnNew">New</button>
         <div class="menu" id="tplMenu">
             <button id="btnTemplates" title="Start from a template">Templates ▾</button>
@@ -259,6 +282,10 @@
         <select id="themeSelect" title="Editor theme"></select>
         <span class="hint"><kbd>Ctrl</kbd>+<kbd>S</kbd> save &nbsp;·&nbsp; <kbd>Ctrl</kbd>+<kbd>F</kbd> find</span>
     </header>
+    <div id="tabStrip" class="tabstrip">
+        <div id="tabList" class="tablist"></div>
+        <button id="btnNewTab" class="newtab" title="New tab (Ctrl+T)">+</button>
+    </div>
     <div id="findBar" class="findbar" style="display:none">
         <input id="findInput" type="text" placeholder="Find" />
         <input id="replaceInput" type="text" placeholder="Replace with" />
