@@ -114,6 +114,9 @@ function activateTab(id){
   setFilePath(tab.path || tab.name || '');
   dirtyDot.classList.toggle('show', tab.dirty);
   updateWordCount();
+  // Find highlights/ranges belong to the DOM of one tab; rebuild them against the newly
+  // active editor so Next/Prev/count don't keep navigating the previous tab's hidden matches.
+  if(findBar && findBar.style.display !== 'none') refreshMatches(false);
   tab.editor.focus();
 }
 
@@ -191,12 +194,29 @@ function setStatus(msg, ms=2200, isError=false){
 // Footer shows the full path when the host can supply one (desktop app), else the name.
 function setFilePath(p){ filePath.textContent = p || 'No file open'; filePath.title = p || ''; }
 
+// A Save As can land on a path another tab already has open. The just-saved tab now holds the
+// authoritative on-disk content, so discard the stale duplicate(s) — otherwise two tabs share
+// one path and one C# _docs entry, and closing either drops the shared encoding/timestamp.
+function dedupeTabsByPath(keep){
+  if(!keep.path) return;
+  for(const other of tabs.filter(t => t !== keep && t.path === keep.path)){
+    const idx = tabs.indexOf(other);
+    other.editor.destroy();
+    other.el.remove();
+    if(other.chip) other.chip.remove();
+    tabs.splice(idx, 1);
+    if(activeId === other.id) activateTab(keep.id);
+  }
+  if(host && host.dirtyChanged) host.dirtyChanged(anyDirty());
+}
+
 // Update a tab after a successful save (name/path may change on a Save As).
 function applySavedToTab(tab, name, path){
   tab.name = name || tab.name;
   tab.path = path || '';
   setDirtyTab(tab, false);
   refreshChip(tab);
+  dedupeTabsByPath(tab); // a Save As may have collided with an already-open file's path
   if(tab.id === activeId) setFilePath(tab.path || tab.name || '');
   setStatus('Saved ' + (name || tab.name));
 }

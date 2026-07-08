@@ -48,6 +48,12 @@ public partial class MainWindow : Window
     // and we launch the matching Path — so JS can only ever start a browser we found.
     private List<(string Id, string Name, string Path)> _browsers = new();
 
+    // Single-instance hand-off (see App.OnStartup): a second launch forwards its file paths to
+    // this window. If they arrive before the WebView2 has finished loading (_webReady), we queue
+    // them and drain the queue in OnNavigationCompleted once the page is ready to receive them.
+    private bool _webReady;
+    private readonly List<string> _pendingOpenPaths = new();
+
     public MainWindow()
     {
         InitializeComponent();
@@ -186,12 +192,20 @@ public partial class MainWindow : Window
             var args = Environment.GetCommandLineArgs();
             foreach (var arg in args)
             {
-                if ((arg.EndsWith(".md", StringComparison.OrdinalIgnoreCase) ||
-                     arg.EndsWith(".markdown", StringComparison.OrdinalIgnoreCase)) &&
-                    File.Exists(arg))
-                {
+                if (MarkdownFile.HasMarkdownExtension(arg) && File.Exists(arg))
                     await OpenFileIntoEditor(arg);
-                }
+            }
+
+            // The page can now receive documents; open anything a second instance forwarded
+            // while we were still loading (see EnqueueOpenFile / App's single-instance server).
+            _webReady = true;
+            if (_pendingOpenPaths.Count > 0)
+            {
+                var pending = _pendingOpenPaths.ToArray();
+                _pendingOpenPaths.Clear();
+                foreach (var p in pending)
+                    if (File.Exists(p))
+                        await OpenFileIntoEditor(p);
             }
 
             // Tell the UI which browsers are installed, so its "Open in Browser" dropdown
@@ -500,6 +514,12 @@ public partial class MainWindow : Window
             return;
         }
 
+        // Save As gives the tab a new path; drop the old path's cached meta so _docs doesn't
+        // accumulate an orphaned entry per rename (the tab no longer references sourcePath).
+        if (!string.IsNullOrEmpty(sourcePath) &&
+            !string.Equals(sourcePath, dlg.FileName, StringComparison.OrdinalIgnoreCase))
+            _docs.Remove(sourcePath);
+
         _docs[dlg.FileName] = meta with { WriteTimeUtc = TryGetWriteTimeUtc(dlg.FileName) };
         Title = $"{Path.GetFileName(dlg.FileName)} — EdMd";
         _ = PostToJs(new { type = "saved", tabId, name = Path.GetFileName(dlg.FileName), path = dlg.FileName });
@@ -586,6 +606,31 @@ public partial class MainWindow : Window
         {
             Log.Write("SetTitleBarDark failed: " + ex);
         }
+    }
+
+    // Called (on the UI thread) by the single-instance pipe server when another launch forwards
+    // a file. Opens it now if the page is ready, else queues it for OnNavigationCompleted to drain.
+    // JS de-dupes by path, so forwarding an already-open file just focuses its existing tab.
+    public void EnqueueOpenFile(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return;
+        if (_webReady)
+            _ = OpenFileIntoEditor(path);
+        else
+            _pendingOpenPaths.Add(path);
+    }
+
+    // Surface the existing window when a second instance hands off (or the user relaunches EdMd):
+    // un-minimize, activate, and a brief top-most toggle to pull it above the foreground app.
+    public void BringToFront()
+    {
+        if (WindowState == WindowState.Minimized)
+            WindowState = WindowState.Normal;
+        Activate();
+        Topmost = true;
+        Topmost = false;
+        Focus();
     }
 
     private async System.Threading.Tasks.Task OpenFileIntoEditor(string path)

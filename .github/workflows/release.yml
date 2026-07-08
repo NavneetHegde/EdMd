@@ -51,7 +51,7 @@ jobs:
           dotnet restore EdMd.slnx
           dotnet test EdMd.slnx -c Release
 
-      # ---- Portable self-contained single-file exe ----
+      # ---- Portable self-contained single-file exe (+ a zipped copy) ----
       - name: Publish portable exe
         shell: pwsh
         run: |
@@ -59,6 +59,14 @@ jobs:
             -p:PublishSingleFile=true -p:Version=${{ steps.ver.outputs.msix }} -o publish/exe
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item publish/exe/EdMd.exe "dist/EdMd-${{ steps.ver.outputs.semver }}-win-x64.exe"
+          # Portable zip: the exe under its plain name plus the license, for users/orgs that
+          # prefer a zipped download over a bare .exe (avoids some SmartScreen/AV friction).
+          $stage = 'publish/portable'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item publish/exe/EdMd.exe "$stage/EdMd.exe"
+          Copy-Item LICENSE "$stage/LICENSE.txt"
+          Compress-Archive -Path "$stage/*" `
+            -DestinationPath "dist/EdMd-${{ steps.ver.outputs.semver }}-win-x64.zip" -Force
 
       # ---- MSIX (interim): sign with the committed self-signed cert via a secret ----
       # Reuses the installer's production path. Users trust certs/edmd-codesign.cer once;
