@@ -17,28 +17,27 @@ public partial class MainWindow : Window
     // .md file could navigate to a remote page that drives the bridge.
     private const string AppOrigin = "https://EdMd.local";
 
-    private string? _openedFilePath;
+    // Per-open-file metadata, keyed by full path. The JS side owns the tab/document model
+    // (content, dirty state, which tab is active); C# only needs, for each file that lives on
+    // disk, the encoding + line ending to round-trip on save and the last-write timestamp to
+    // detect an external edit before overwriting. Untitled (never-saved) tabs have no entry
+    // here — they use DefaultMeta until their first Save As creates a path.
+    private sealed record DocMeta(Encoding Encoding, string Newline, DateTime? WriteTimeUtc);
 
-    // Encoding of the currently-open file, detected on open and reused on save so we don't
-    // silently rewrite a UTF-8-with-BOM or UTF-16 file as UTF-8-no-BOM. Defaults to UTF-8
-    // without a BOM for a fresh/new document.
-    private Encoding _openedEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+    // UTF-8 without a BOM, LF line endings — what a fresh/never-saved document saves as.
+    private static readonly DocMeta DefaultMeta =
+        new(new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), "\n", null);
 
-    // Line ending of the currently-open file. The editor normalizes to '\n' internally, so we
-    // remember the original and restore it on save; defaults to '\n' for a fresh document.
-    private string _openedNewline = "\n";
+    private readonly Dictionary<string, DocMeta> _docs = new(StringComparer.OrdinalIgnoreCase);
 
-    // Last-write timestamp of the open file when we last read or wrote it. Used to detect that
-    // another application changed the file on disk before we overwrite it, so we can warn rather
-    // than silently clobber the external edit. Null for a never-saved (new) document.
-    private DateTime? _openedFileWriteTimeUtc;
+    private DocMeta MetaFor(string? path) =>
+        path != null && _docs.TryGetValue(path, out var m) ? m : DefaultMeta;
 
-    // Dirty state is mirrored from the JS editor (it owns the document); the C# side needs
-    // it to guard the window-close path. _forceClose/_closePending drive the save-then-close
-    // handshake (see MainWindow_Closing / HandleSaveResult).
-    private bool _isDirty;
+    // Aggregate dirty flag mirrored from JS (true if ANY tab has unsaved changes); the C# side
+    // needs it only to guard the window-close path. _forceClose latches the close once the user
+    // has chosen to discard, or JS has reported every dirty tab saved (see the close handshake).
+    private bool _isAnyDirty;
     private bool _forceClose;
-    private bool _closePending;
 
     // Lazily started when the user first clicks "Open in Browser"; serves wwwroot over
     // http://localhost so the full editor (with File System Access open/save) runs in Chrome.
@@ -106,12 +105,14 @@ public partial class MainWindow : Window
         }
     }
 
-    // Warn about unsaved edits before the window closes. The document lives in JS, so a
-    // "Save" answer round-trips: cancel the close, ask JS to save, and close once it reports
-    // success (HandleSaveResult). "Don't Save" closes; "Cancel" stays.
+    // Warn about unsaved edits before the window closes. The documents live in JS (one per
+    // tab), so a "Save" answer round-trips: cancel the close, ask JS to save every dirty tab,
+    // and close once JS reports they're all saved (the readyToClose message). "Don't Save"
+    // closes; "Cancel" stays. A cancelled Save As mid-flow leaves the window open (JS simply
+    // never sends readyToClose).
     private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
-        if (_forceClose || !_isDirty)
+        if (_forceClose || !_isAnyDirty)
             return;
 
         var result = MessageBox.Show(this,
@@ -126,24 +127,10 @@ public partial class MainWindow : Window
         {
             _forceClose = true; // discard and let the close proceed
         }
-        else // Yes — save first, then close when JS round-trips the save
+        else // Yes — save every dirty tab first, then close when JS reports readyToClose
         {
             e.Cancel = true;
-            _closePending = true;
             _ = PostToJs(new { type = "requestSaveForClose" });
-        }
-    }
-
-    // Called after every save attempt. If a close is waiting on the save, finish it only
-    // when the save actually succeeded (a cancelled Save As dialog leaves the window open).
-    private void HandleSaveResult(bool saved)
-    {
-        if (!_closePending) return;
-        _closePending = false;
-        if (saved)
-        {
-            _forceClose = true;
-            Close();
         }
     }
 
@@ -194,18 +181,16 @@ public partial class MainWindow : Window
         // async void: swallow-and-log so a startup file error can't crash the process.
         try
         {
-            // Handle a file passed on the command line (double-click, or "Open with")
+            // Handle files passed on the command line (double-click, or "Open with"). Multiple
+            // .md/.markdown args each open into their own tab.
             var args = Environment.GetCommandLineArgs();
             foreach (var arg in args)
             {
-                if (arg.EndsWith(".md", StringComparison.OrdinalIgnoreCase) ||
-                    arg.EndsWith(".markdown", StringComparison.OrdinalIgnoreCase))
+                if ((arg.EndsWith(".md", StringComparison.OrdinalIgnoreCase) ||
+                     arg.EndsWith(".markdown", StringComparison.OrdinalIgnoreCase)) &&
+                    File.Exists(arg))
                 {
-                    if (File.Exists(arg))
-                    {
-                        await OpenFileIntoEditor(arg);
-                    }
-                    break;
+                    await OpenFileIntoEditor(arg);
                 }
             }
 
@@ -257,40 +242,58 @@ public partial class MainWindow : Window
                     {
                         var dlg = new OpenFileDialog
                         {
-                            Filter = "Markdown (*.md;*.markdown)|*.md;*.markdown|All files (*.*)|*.*"
+                            Filter = "Markdown (*.md;*.markdown)|*.md;*.markdown|All files (*.*)|*.*",
+                            Multiselect = true // each selected file opens into its own tab
                         };
                         if (dlg.ShowDialog() == true)
                         {
-                            await OpenFileIntoEditor(dlg.FileName);
+                            foreach (var file in dlg.FileNames)
+                                await OpenFileIntoEditor(file);
                         }
                         break;
                     }
 
                 case "save":
                     {
+                        int tabId = GetTabId(msg);
+                        string path = GetString(msg, "path");
                         string content = GetContent(msg);
-                        bool saved = string.IsNullOrEmpty(_openedFilePath)
-                            ? SaveAs(content)
-                            : await SaveToPath(_openedFilePath, content);
-                        HandleSaveResult(saved);
+                        if (string.IsNullOrEmpty(path))
+                            SaveAs(tabId, path, GetString(msg, "name"), content);
+                        else
+                            await SaveToPath(tabId, path, content);
                         break;
                     }
 
                 case "saveAs":
-                    {
-                        bool saved = SaveAs(GetContent(msg));
-                        HandleSaveResult(saved);
-                        break;
-                    }
-
-                case "dirty":
-                    _isDirty = msg.TryGetProperty("value", out var dv) && dv.ValueKind == JsonValueKind.True;
+                    SaveAs(GetTabId(msg), GetString(msg, "path"), GetString(msg, "name"), GetContent(msg));
                     break;
 
-                case "reset":
-                    // "New file" in the UI: forget the currently-open path so the next Save
-                    // prompts for a new file (Save As) instead of overwriting the last file.
-                    _openedFilePath = null;
+                case "dirty":
+                    _isAnyDirty = msg.TryGetProperty("value", out var dv) && dv.ValueKind == JsonValueKind.True;
+                    break;
+
+                case "readyToClose":
+                    // JS has saved every dirty tab (the close handshake) — let the window close.
+                    _forceClose = true;
+                    Close();
+                    break;
+
+                case "tabClosed":
+                    // A tab was closed in JS; forget its cached encoding/newline/timestamp so
+                    // _docs doesn't accumulate stale entries over a long session. Reopening the
+                    // file re-detects them in OpenFileIntoEditor.
+                    {
+                        string closedPath = GetString(msg, "path");
+                        if (!string.IsNullOrEmpty(closedPath))
+                            _docs.Remove(closedPath);
+                    }
+                    break;
+
+                case "theme":
+                    // The web UI picked a (light/dark) theme; match the native window title bar so
+                    // the OS caption isn't a light strip above a dark editor (and vice versa).
+                    SetTitleBarDark(msg.TryGetProperty("dark", out var td) && td.ValueKind == JsonValueKind.True);
                     break;
 
                 case "openInBrowser":
@@ -298,6 +301,10 @@ public partial class MainWindow : Window
                         string markdown = msg.TryGetProperty("markdown", out var mdp) && mdp.ValueKind == JsonValueKind.String
                             ? mdp.GetString() ?? ""
                             : "";
+                        // The active tab's name/path, so the browser hand-off shows the right file
+                        // (C# no longer tracks a single "open" document).
+                        string name = GetString(msg, "name");
+                        string path = GetString(msg, "path");
                         // Optional: the specific browser the user picked from the dropdown. We map
                         // the Id back to a path from our own discovered list (never trust a path
                         // from JS); an unknown/empty Id falls through to the auto-pick.
@@ -307,7 +314,7 @@ public partial class MainWindow : Window
                         string? browserPath = string.IsNullOrEmpty(browserId)
                             ? null
                             : _browsers.Find(b => b.Id == browserId).Path;
-                        OpenInBrowserEditor(markdown, browserPath);
+                        OpenInBrowserEditor(markdown, name, path, browserPath);
                         break;
                     }
             }
@@ -315,7 +322,6 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             Log.Write("OnWebMessageReceived failed: " + ex);
-            _closePending = false; // don't strand a pending close on an unexpected error
             await ReportError("Something went wrong. See the log in %LOCALAPPDATA%\\EdMd\\logs.", ex);
         }
     }
@@ -324,7 +330,7 @@ public partial class MainWindow : Window
     // the current document. We serve wwwroot over http://localhost — a secure context, so
     // the browser build can use the File System Access API — and pass the document via the
     // server's /__session route (see the ?session=1 branch in index.html).
-    private void OpenInBrowserEditor(string markdown, string? browserPath)
+    private void OpenInBrowserEditor(string markdown, string name, string path, string? browserPath)
     {
         if (_browserServer == null)
         {
@@ -333,11 +339,9 @@ public partial class MainWindow : Window
             _browserServer.Start();
         }
 
-        _browserServer.SessionName = string.IsNullOrEmpty(_openedFilePath)
-            ? "untitled.md"
-            : Path.GetFileName(_openedFilePath);
+        _browserServer.SessionName = string.IsNullOrEmpty(name) ? "untitled.md" : name;
         _browserServer.SessionContent = markdown;
-        _browserServer.SessionPath = _openedFilePath ?? "";
+        _browserServer.SessionPath = path;
         // Fresh nonce each hand-off; /__session only answers requests carrying it.
         string token = Guid.NewGuid().ToString("N");
         _browserServer.SessionToken = token;
@@ -456,47 +460,59 @@ public partial class MainWindow : Window
         }
     }
 
-    private static string GetContent(JsonElement msg) =>
-        msg.TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.String
-            ? c.GetString() ?? ""
+    private static string GetContent(JsonElement msg) => GetString(msg, "content");
+
+    private static string GetString(JsonElement msg, string name) =>
+        msg.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String
+            ? v.GetString() ?? ""
             : "";
 
-    // Returns true only if the file was actually written (false if the user cancelled the
-    // dialog or the write failed), so the save-then-close handshake knows whether to close.
-    private bool SaveAs(string content)
+    // The JS-owned tab id, echoed back on the save result so JS can route it to the right tab.
+    private static int GetTabId(JsonElement msg) =>
+        msg.TryGetProperty("tabId", out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : 0;
+
+    // Save a tab's content under a newly-chosen path. `sourcePath` is the tab's current path (empty
+    // for a never-saved tab); we copy its encoding/newline from _docs so a Save As round-trips the
+    // original file's format. Reports the outcome to the tab via `saved` (success) or `saveResult`
+    // (cancel/failure) so the JS close handshake knows whether the save happened.
+    private void SaveAs(int tabId, string sourcePath, string suggestedName, string content)
     {
         var dlg = new SaveFileDialog
         {
             Filter = "Markdown (*.md;*.markdown)|*.md;*.markdown|All files (*.*)|*.*",
-            FileName = string.IsNullOrEmpty(_openedFilePath) ? "untitled.md" : Path.GetFileName(_openedFilePath)
+            FileName = string.IsNullOrEmpty(suggestedName) ? "untitled.md" : suggestedName
         };
         if (dlg.ShowDialog() != true)
-            return false;
+        {
+            _ = PostSaveResult(tabId, false);
+            return;
+        }
 
+        var meta = MetaFor(string.IsNullOrEmpty(sourcePath) ? null : sourcePath);
         try
         {
-            // Preserve the open document's encoding and line endings when saving under a new name.
-            AtomicFile.WriteAllText(dlg.FileName, AtomicFile.NormalizeNewlines(content, _openedNewline), _openedEncoding);
+            AtomicFile.WriteAllText(dlg.FileName, AtomicFile.NormalizeNewlines(content, meta.Newline), meta.Encoding);
         }
         catch (Exception ex)
         {
             _ = ReportError($"Couldn't save {Path.GetFileName(dlg.FileName)}: {ex.Message}", ex);
-            return false;
+            _ = PostSaveResult(tabId, false);
+            return;
         }
 
-        _openedFilePath = dlg.FileName;
-        _openedFileWriteTimeUtc = TryGetWriteTimeUtc(dlg.FileName);
+        _docs[dlg.FileName] = meta with { WriteTimeUtc = TryGetWriteTimeUtc(dlg.FileName) };
         Title = $"{Path.GetFileName(dlg.FileName)} — EdMd";
-        _ = PostToJs(new { type = "saved", name = Path.GetFileName(dlg.FileName), path = dlg.FileName });
-        return true;
+        _ = PostToJs(new { type = "saved", tabId, name = Path.GetFileName(dlg.FileName), path = dlg.FileName });
     }
 
-    private async System.Threading.Tasks.Task<bool> SaveToPath(string path, string content)
+    private async System.Threading.Tasks.Task SaveToPath(int tabId, string path, string content)
     {
+        var meta = MetaFor(path);
+
         // Guard against clobbering an external edit: if the file's on-disk timestamp changed
         // since we last read/wrote it, another app has modified it. Ask before overwriting.
         // (A file that vanished — current == null — has nothing to lose, so we just recreate it.)
-        if (_openedFileWriteTimeUtc is DateTime known &&
+        if (meta.WriteTimeUtc is DateTime known &&
             TryGetWriteTimeUtc(path) is DateTime current && current != known)
         {
             var choice = MessageBox.Show(this,
@@ -508,26 +524,37 @@ public partial class MainWindow : Window
                 "EdMd — file changed on disk", MessageBoxButton.YesNoCancel, MessageBoxImage.Warning);
 
             if (choice == MessageBoxResult.Cancel)
-                return false;
+            {
+                await PostSaveResult(tabId, false);
+                return;
+            }
             if (choice == MessageBoxResult.No)
-                return SaveAs(content);
+            {
+                SaveAs(tabId, path, Path.GetFileName(path), content);
+                return;
+            }
             // Yes — fall through and overwrite the external changes.
         }
 
         try
         {
-            AtomicFile.WriteAllText(path, AtomicFile.NormalizeNewlines(content, _openedNewline), _openedEncoding);
+            AtomicFile.WriteAllText(path, AtomicFile.NormalizeNewlines(content, meta.Newline), meta.Encoding);
         }
         catch (Exception ex)
         {
             await ReportError($"Couldn't save {Path.GetFileName(path)}: {ex.Message}", ex);
-            return false;
+            await PostSaveResult(tabId, false);
+            return;
         }
 
-        _openedFileWriteTimeUtc = TryGetWriteTimeUtc(path);
-        await PostToJs(new { type = "saved", name = Path.GetFileName(path), path });
-        return true;
+        _docs[path] = meta with { WriteTimeUtc = TryGetWriteTimeUtc(path) };
+        await PostToJs(new { type = "saved", tabId, name = Path.GetFileName(path), path });
     }
+
+    // Tell JS a save request did NOT write (cancelled dialog or failed write). Success is reported
+    // via `saved` instead. The close handshake awaits one of these two per requested save.
+    private System.Threading.Tasks.Task PostSaveResult(int tabId, bool ok) =>
+        PostToJs(new { type = "saveResult", tabId, ok });
 
     // The file's current last-write time in UTC, or null if it's missing/unreadable. Used as the
     // baseline for detecting an external edit before an overwrite.
@@ -535,6 +562,30 @@ public partial class MainWindow : Window
     {
         try { return File.Exists(path) ? File.GetLastWriteTimeUtc(path) : null; }
         catch { return null; }
+    }
+
+    // Match the native window title bar to the web UI's light/dark theme via the DWM immersive
+    // dark-mode attribute. The attribute id changed at Windows 10 20H1 (20 vs. the older 19), so
+    // fall back to the legacy id; on older/unsupported builds the call just no-ops.
+    private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+    private const int DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19;
+
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll", PreserveSig = true)]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+    private void SetTitleBarDark(bool dark)
+    {
+        try
+        {
+            var hwnd = new System.Windows.Interop.WindowInteropHelper(this).EnsureHandle();
+            int value = dark ? 1 : 0;
+            if (DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref value, sizeof(int)) != 0)
+                DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1, ref value, sizeof(int));
+        }
+        catch (Exception ex)
+        {
+            Log.Write("SetTitleBarDark failed: " + ex);
+        }
     }
 
     private async System.Threading.Tasks.Task OpenFileIntoEditor(string path)
@@ -551,13 +602,13 @@ public partial class MainWindow : Window
         }
 
         // Detect and remember the file's encoding so a later save round-trips it (BOM and all).
-        try { _openedEncoding = AtomicFile.DetectEncoding(path); }
-        catch { _openedEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false); }
+        Encoding encoding;
+        try { encoding = AtomicFile.DetectEncoding(path); }
+        catch { encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false); }
         // Same for its line endings — the editor works in '\n', so remember CRLF vs LF.
-        _openedNewline = AtomicFile.DetectNewline(content);
+        string newline = AtomicFile.DetectNewline(content);
 
-        _openedFilePath = path;
-        _openedFileWriteTimeUtc = TryGetWriteTimeUtc(path);
+        _docs[path] = new DocMeta(encoding, newline, TryGetWriteTimeUtc(path));
         Title = $"{Path.GetFileName(path)} — EdMd";
         await PostToJs(new { type = "fileOpened", name = Path.GetFileName(path), content, path });
     }
