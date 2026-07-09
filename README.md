@@ -13,11 +13,12 @@ skills, `CLAUDE.md` files, PRs, and specs — with a live token/word/char counte
 middle-click to close, or open/select many files at once). Double-clicking a `.md` in Explorer
 opens it as a new tab in the running window instead of launching a second copy.
 
-> <img width="1910" height="1027" alt="image" src="https://github.com/user-attachments/assets/7e83a1d1-f74e-4280-812f-eca0e911b663" />
+> <img width="1520" height="793" alt="image" src="https://github.com/user-attachments/assets/519be67c-332c-439e-aa3b-2757c6052dbc" />
+
 
 In Browser
 
-<img width="1319" height="1027" alt="image" src="https://github.com/user-attachments/assets/ab383186-012b-426d-94fb-82afb737be06" />
+<img width="1920" height="1032" alt="image" src="https://github.com/user-attachments/assets/86bb2144-1458-46c8-8df5-f960ce7ab9f2" />
 
 
 ## Install
