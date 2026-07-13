@@ -20,6 +20,7 @@ treats a JS-owned `tabId` as an opaque echo token on save round-trips. It is als
 The core is a handful of small files: `MainWindow.xaml(.cs)`, `App.xaml(.cs)`,
 `wwwroot/index.html` + `wwwroot/app.js` (all the front-end logic), `LocalWebServer.cs`
 (a loopback HTTP server used only by the "Open in Browser" action — see the bridge
+section), `SessionStore.cs` (the pure serialize/parse for session restore — see the bridge
 section), and `Log.cs` (a dependency-free file logger). `App.xaml.cs` wires the global
 exception handlers **and** the single-instance mutex + named-pipe server.
 
@@ -53,8 +54,9 @@ dotnet test        # from src/EdMd.Tests/ or the repo root
 ```
 They cover the pure/security-sensitive C# logic: `LocalWebServer` (static file serving,
 MIME, 404/405, the `/__session` token gate, and path-traversal blocking), `AtomicFile`
-(the temp-file+atomic-replace write), and `MarkdownFile` (the `.md`/`.markdown` extension
-gate for command-line opens and single-instance forwarding). GUI/bridge code (tabs,
+(the temp-file+atomic-replace write), `MarkdownFile` (the `.md`/`.markdown` extension
+gate for command-line opens and single-instance forwarding), and `SessionStore`
+(the session-restore serialize/round-trip + tolerant parse of a corrupt session file). GUI/bridge code (tabs,
 single-instance plumbing, the WebView2 bridge) and the front-end JS are not covered. There is no linter or CI. `EdMd.slnx` at the repo root is the (XML) solution
 file (now lists both projects). Note the project file is `EdMd.csproj` but `AssemblyName` is
 `EdMd`, so the built/published binary is **`EdMd.exe`** — installer and
@@ -91,7 +93,9 @@ HTTP server or other IPC. (`LocalWebServer` exists only for the browser handoff,
   markdown string), `openInBrowser` (includes `markdown` + the active tab's `name`/`path`),
   `dirty` (mirrors an **aggregate** flag — true if *any* tab is unsaved — so the close guard
   works), `tabClosed` (a `path`, so C# drops that file's cached save metadata), `theme`
-  (a `dark` bool, to match the native title bar — see Gotchas), and `readyToClose` (the
+  (a `dark` bool, to match the native title bar — see Gotchas), `sessionSnapshot` (the whole
+  tab model — `activeIndex` + a `tabs` array of `{name,path,dirty,content}` — for session
+  restore / crash recovery, see below), and `readyToClose` (the
   close handshake). C# owns the OpenFileDialog (now `Multiselect` — each file opens a
   tab)/SaveFileDialog and the actual `File.ReadAllText`/`WriteAllText`, each wrapped so an
   I/O failure logs + reports rather than crashing. **C# holds no "current file" —** instead
@@ -103,7 +107,9 @@ HTTP server or other IPC. (`LocalWebServer` exists only for the browser handoff,
   `fileOpened` (name + content + full `path` → opens/reuses a tab), `saved` (`tabId` +
   name + full `path` — a successful write), `saveResult` (`tabId` + `ok:false` — a cancelled
   dialog or failed write), `error` (a short message shown red in the footer),
-  `requestSaveForClose` (asks JS to save every dirty tab so the window can close), and
+  `requestSaveForClose` (asks JS to save every dirty tab so the window can close),
+  `restoreSession` (`activeIndex` + a `tabs` array to rebuild last session's tabs — sent
+  once on load, *always*, even empty, so JS stops holding back snapshots; see below), and
   `browsers` (the `{id,name}` list of Chromium browsers found on this machine, sent once on
   load to fill the "Open in Browser" dropdown). The JS `message` listener in `app.js` routes
   `saved`/`saveResult` back to the originating tab by `tabId` (resolving that tab's pending
@@ -119,6 +125,19 @@ HTTP server or other IPC. (`LocalWebServer` exists only for the browser handoff,
   `readyToClose` — which sets `_forceClose` and re-`Close()`s. Any cancelled save aborts the
   close (JS simply never sends `readyToClose`). Per-tab close (chip ×, middle-click, Ctrl+W)
   `confirm()`s in JS before discarding a dirty tab; the app never drops below one tab.
+- **Session restore / crash recovery (desktop only):** JS is the source of truth for the tab
+  model, so it mirrors a whole-model snapshot (`sessionSnapshot`) to C# — debounced on edits,
+  immediate on structural changes (open/close/activate/save) — and C# writes it atomically to
+  `%LOCALAPPDATA%\EdMd\session.json` (`SaveSession`). On launch, `RestoreSession` (called at the
+  top of `OnNavigationCompleted`, **before** command-line files) re-reads that file and posts one
+  `restoreSession` batch: saved+clean tabs show fresh disk content (and their `DocMeta` is
+  repopulated so a later save round-trips + the external-change guard has a baseline), saved+dirty
+  and untitled tabs keep their **recovered buffer**, and a saved+clean tab whose file is gone is
+  dropped. The (de)serialization is the pure, unit-tested `SessionStore` (`Serialize`/`Parse`,
+  `Parse` returns null on any malformed input so a corrupt file never crashes the launch). JS
+  suppresses snapshots (`restoring` flag) until `restoreSession` arrives — otherwise the empty tab
+  it boots with would clobber the file first; a 3s safety timeout un-gates if the message never
+  comes. `restoreSession` is therefore always sent, even for an empty/absent session.
 - **Open in Browser (`openInBrowser` → `OpenInBrowserEditor`):** opens the *full*
   editor in Chrome, pre-loaded with the current document — not a static preview. C#
   lazily starts `LocalWebServer` (an in-process loopback `TcpListener` on an ephemeral

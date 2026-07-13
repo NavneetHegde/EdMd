@@ -187,6 +187,11 @@ public partial class MainWindow : Window
         // async void: swallow-and-log so a startup file error can't crash the process.
         try
         {
+            // Reopen the tabs from the previous session first, so they form the base the user
+            // left off at; any file also passed on the command line de-dupes against them in JS
+            // (openInTab focuses an already-open path) and lands after the restored tabs.
+            await RestoreSession();
+
             // Handle files passed on the command line (double-click, or "Open with"). Multiple
             // .md/.markdown args each open into their own tab.
             var args = Environment.GetCommandLineArgs();
@@ -291,6 +296,13 @@ public partial class MainWindow : Window
                     // JS has saved every dirty tab (the close handshake) — let the window close.
                     _forceClose = true;
                     Close();
+                    break;
+
+                case "sessionSnapshot":
+                    // JS mirrors its whole tab model (order, active tab, per-tab content + dirty
+                    // flag) here whenever it changes; persist it so the next launch can restore
+                    // the tabs and recover any unsaved edits after a crash. Fire-and-forget.
+                    SaveSession(msg);
                     break;
 
                 case "tabClosed":
@@ -656,6 +668,118 @@ public partial class MainWindow : Window
         _docs[path] = new DocMeta(encoding, newline, TryGetWriteTimeUtc(path));
         Title = $"{Path.GetFileName(path)} — EdMd";
         await PostToJs(new { type = "fileOpened", name = Path.GetFileName(path), content, path });
+    }
+
+    // Persist the JS-supplied session snapshot to session.json (atomic write). C# stays stateless
+    // about tabs: it just serialises what JS mirrored (order, active index, per-tab content/dirty)
+    // and never inspects it beyond that. Best-effort — a write failure logs but must not disrupt
+    // editing, so this is fire-and-forget.
+    private void SaveSession(JsonElement msg)
+    {
+        try
+        {
+            int activeIndex = msg.TryGetProperty("activeIndex", out var ai) && ai.ValueKind == JsonValueKind.Number
+                ? ai.GetInt32() : 0;
+            var list = new List<SessionStore.Tab>();
+            if (msg.TryGetProperty("tabs", out var tabsEl) && tabsEl.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var t in tabsEl.EnumerateArray())
+                {
+                    list.Add(new SessionStore.Tab(
+                        GetString(t, "name"),
+                        GetString(t, "path"),
+                        t.TryGetProperty("dirty", out var d) && d.ValueKind == JsonValueKind.True,
+                        GetString(t, "content")));
+                }
+            }
+
+            string json = SessionStore.Serialize(new SessionStore.Data(activeIndex, list));
+            Directory.CreateDirectory(Path.GetDirectoryName(SessionStore.DefaultPath)!);
+            AtomicFile.WriteAllText(SessionStore.DefaultPath, json, DefaultMeta.Encoding);
+        }
+        catch (Exception ex)
+        {
+            Log.Write("SaveSession failed: " + ex);
+        }
+    }
+
+    // Rebuild the previous session's tabs on startup and post them to JS as one `restoreSession`
+    // batch. Saved files are re-read from disk so their DocMeta (encoding/newline/timestamp) is
+    // repopulated — a later save round-trips the file and the external-change guard has a baseline.
+    // Rules per tab:
+    //   untitled  → restore its buffer (skip a pristine, never-edited blank).
+    //   saved+clean→ show fresh disk content; drop the tab if the file is gone/unreadable.
+    //   saved+dirty→ keep the recovered buffer (crash recovery), meta read from disk if it exists.
+    private async System.Threading.Tasks.Task RestoreSession()
+    {
+        var outTabs = new List<object>();
+        int activeIndex = 0;
+        try
+        {
+            if (File.Exists(SessionStore.DefaultPath))
+            {
+                var data = SessionStore.Parse(await File.ReadAllTextAsync(SessionStore.DefaultPath));
+                if (data != null && data.Tabs.Count > 0)
+                {
+                    foreach (var t in data.Tabs)
+                        await RestoreOneTab(t, outTabs);
+                    if (outTabs.Count > 0)
+                        activeIndex = Math.Clamp(data.ActiveIndex, 0, outTabs.Count - 1);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Write("RestoreSession failed: " + ex);
+            outTabs.Clear();
+            activeIndex = 0;
+        }
+
+        // Always tell JS restore is finished — even with an empty list — so it stops holding back
+        // the crash-recovery snapshots it suppresses until this message arrives (see app.js).
+        await PostToJs(new { type = "restoreSession", activeIndex, tabs = outTabs });
+    }
+
+    // Reconstruct one persisted tab into `outTabs` (a `restoreSession` descriptor), repopulating
+    // DocMeta from disk for saved files. See RestoreSession for the per-category rules.
+    private async System.Threading.Tasks.Task RestoreOneTab(SessionStore.Tab t, List<object> outTabs)
+    {
+        if (string.IsNullOrEmpty(t.Path))
+        {
+            // Untitled — only worth restoring if it actually held work.
+            if (t.Dirty || !string.IsNullOrEmpty(t.Content))
+                outTabs.Add(new { name = t.Name, path = "", content = t.Content, dirty = t.Dirty });
+            return;
+        }
+
+        if (File.Exists(t.Path))
+        {
+            try
+            {
+                string disk = await File.ReadAllTextAsync(t.Path);
+                Encoding encoding;
+                try { encoding = AtomicFile.DetectEncoding(t.Path); }
+                catch { encoding = DefaultMeta.Encoding; }
+                _docs[t.Path] = new DocMeta(encoding, AtomicFile.DetectNewline(disk), TryGetWriteTimeUtc(t.Path));
+                // Clean tab shows the current file; a dirty tab keeps its recovered edits.
+                string content = t.Dirty ? t.Content : disk;
+                outTabs.Add(new { name = t.Name, path = t.Path, content, dirty = t.Dirty });
+            }
+            catch (Exception ex)
+            {
+                Log.Write("RestoreSession couldn't read " + t.Path + ": " + ex);
+                // Preserve unsaved edits even if the file can't be read; drop clean tabs.
+                if (t.Dirty)
+                    outTabs.Add(new { name = t.Name, path = t.Path, content = t.Content, dirty = true });
+            }
+        }
+        else if (t.Dirty)
+        {
+            // File is gone but there are unsaved edits — recover them (the path is kept so a save
+            // re-targets the original location; if its folder is gone the save reports the error).
+            outTabs.Add(new { name = t.Name, path = t.Path, content = t.Content, dirty = true });
+        }
+        // saved + clean + missing → nothing to lose, drop it.
     }
 
     // Log the detail, show the user a short message via the footer status line.
