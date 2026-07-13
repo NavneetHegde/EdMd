@@ -21,6 +21,9 @@ const editorHost = document.getElementById('editorHost');
 const tabs = [];
 let activeId = null;
 let nextTabId = 1;
+// True only while a restored session is being rebuilt, so the flurry of change/activate events
+// that rebuild fires doesn't feed back into the session snapshot (which we write once at the end).
+let restoring = false;
 
 const tabById = (id) => tabs.find(t => t.id === id);
 const activeTab = () => tabById(activeId);
@@ -54,6 +57,7 @@ function createEmptyTab(){
   const tab = { id, name: '', path: '', dirty: false, editor, el, fileHandle: null };
   editor.on('change', () => {
     setDirtyTab(tab, true);
+    scheduleSnapshot(); // persist edits for crash recovery (debounced)
     if(tab.id === activeId){
       updateWordCount();
       // Keep find highlights in sync while the active doc changes with the find bar open.
@@ -74,6 +78,9 @@ function loadContent(tab, content){
   tab.editor.setMarkdown(content || '', false);
   resetUndoHistory(tab.editor); // the loaded doc is the undo baseline, not an undoable edit
   setDirtyTab(tab, false);
+  // Toast parks the caret at the document end after setMarkdown; a freshly opened file should
+  // start at the top instead (the subsequent activateTab focus() preserves this position).
+  tab.editor.moveCursorToStart(false);
   if(tab.id === activeId) updateWordCount();
 }
 
@@ -118,6 +125,7 @@ function activateTab(id){
   // active editor so Next/Prev/count don't keep navigating the previous tab's hidden matches.
   if(findBar && findBar.style.display !== 'none') refreshMatches(false);
   tab.editor.focus();
+  scheduleSnapshot(); // remember which tab is active for next launch
 }
 
 function closeTab(id){
@@ -138,6 +146,7 @@ function closeTab(id){
   // Let C# drop this file's cached encoding/timestamp so _docs doesn't grow across a session.
   if(host && host.tabClosed && tab.path) host.tabClosed(tab.path);
   if(host && host.dirtyChanged) host.dirtyChanged(anyDirty());
+  scheduleSnapshot(); // the closed tab shouldn't come back next launch
 }
 
 // ---- Tab strip chips --------------------------------------------------------------------
@@ -219,6 +228,60 @@ function applySavedToTab(tab, name, path){
   dedupeTabsByPath(tab); // a Save As may have collided with an already-open file's path
   if(tab.id === activeId) setFilePath(tab.path || tab.name || '');
   setStatus('Saved ' + (name || tab.name));
+  scheduleSnapshot(); // path/name/dirty changed — update the persisted session
+}
+
+// ---- Session persistence (desktop): reopen tabs next launch + crash-recover unsaved edits ----
+// The whole tab model is JS-owned, so JS is the source of truth: we mirror a snapshot of every
+// tab (order, active tab, per-tab markdown + dirty flag) to C#, which writes it to session.json.
+// host.sessionChanged only exists in the desktop build (the browser build has no C# to persist
+// to), so every entry point guards on it.
+let sessionTimer = null;
+function snapshotSession(){
+  if(restoring || !host || !host.sessionChanged) return;
+  const activeIndex = Math.max(0, tabs.findIndex(t => t.id === activeId));
+  host.sessionChanged({
+    activeIndex,
+    tabs: tabs.map(t => ({
+      name: t.name || '', path: t.path || '', dirty: !!t.dirty, content: t.editor.getMarkdown(),
+    })),
+  });
+}
+// Debounced so a burst of keystrokes collapses into one disk write; the delay is short enough
+// that a crash loses at most the last fraction of a second of typing.
+function scheduleSnapshot(){
+  if(restoring || !host || !host.sessionChanged) return;
+  clearTimeout(sessionTimer);
+  sessionTimer = setTimeout(snapshotSession, 800);
+}
+
+// Rebuild the tabs C# reconstructed from the last session (see MainWindow.RestoreSession). Each
+// entry carries its content + dirty flag; dirty entries are the crash-recovered buffers.
+function restoreSession(data){
+  const list = (data && data.tabs) || [];
+  const built = [];
+  try{
+    for(const s of list){
+      // Reuse the pristine booted-in empty tab for the first doc so we don't leave a blank behind.
+      const tab = (built.length === 0 && isReusableEmpty(activeTab())) ? activeTab() : createEmptyTab();
+      tab.name = s.name || '';
+      tab.path = s.path || '';
+      tab.fileHandle = null;
+      loadContent(tab, s.content || '');   // clears dirty…
+      if(s.dirty) setDirtyTab(tab, true);  // …then re-flag the recovered/unsaved ones
+      refreshChip(tab);
+      built.push(tab);
+    }
+    if(built.length){
+      const idx = Math.min(Math.max(0, (data.activeIndex|0)), built.length - 1);
+      activateTab(built[idx].id);
+      setStatus('Restored ' + built.length + (built.length === 1 ? ' tab' : ' tabs'));
+    }
+  } finally {
+    // Restore is done (even an empty session un-gates) — crash-recovery snapshots may resume.
+    restoring = false;
+  }
+  snapshotSession(); // persist the normalised state (drops any tabs C# couldn't restore)
 }
 
 // ---- Host abstraction: WebView2 bridge (desktop) OR File System Access API (Chrome) ----
@@ -276,6 +339,7 @@ if(IS_DESKTOP){
     else if(msg.type === 'error') setStatus(msg.message, 6000, true);
     else if(msg.type === 'exported') setStatus('Exported ' + (msg.name || 'document')); // C# wrote the PDF/HTML
     else if(msg.type === 'requestSaveForClose') saveAllForClose();
+    else if(msg.type === 'restoreSession') restoreSession(msg); // reopen last session's tabs
     else if(msg.type === 'browsers') populateBrowserMenu(msg.list); // installed browsers for the dropdown
   });
   // Save every dirty tab in turn for the window-close handshake; on any cancel, abort the
@@ -302,6 +366,7 @@ if(IS_DESKTOP){
     dirtyChanged: (v)=> send({ type: 'dirty', value: !!v }),
     tabClosed: (path)=> send({ type: 'tabClosed', path }), // drop C#'s cached meta for the file
     themeChanged: (dark)=> send({ type: 'theme', dark: !!dark }), // dark-mode the native title bar
+    sessionChanged: (data)=> send({ type: 'sessionSnapshot', activeIndex: data.activeIndex, tabs: data.tabs }),
     // Export the rendered document. JS builds the standalone HTML (so desktop + browser produce
     // the same file); C# owns the Save dialog + disk write, and — for PDF — renders that HTML in
     // an offscreen WebView2 and prints it to PDF.
@@ -312,6 +377,11 @@ if(IS_DESKTOP){
       setStatus(kind === 'pdf' ? 'Exporting PDF…' : 'Exporting HTML…');
     },
   };
+  // Hold off snapshots until C# sends restoreSession, so the empty tab we boot with can't
+  // overwrite session.json before the previous session is restored. Safety timeout un-gates in
+  // case that message never arrives (e.g. an older host), so crash-recovery still kicks in.
+  restoring = true;
+  setTimeout(()=>{ if(restoring){ restoring = false; snapshotSession(); } }, 3000);
 } else {
   // Chromium (Chrome/Edge): real local open/save via the File System Access API.
   // Needs a secure context — serve the folder over http://localhost (see serve.ps1).
