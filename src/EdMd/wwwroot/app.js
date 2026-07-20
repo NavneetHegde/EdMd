@@ -34,7 +34,7 @@ const findTabByPath = (p) => (p ? tabs.find(t => t.path === p) : null);
 // doesn't leave an empty tab behind (Notepad-style).
 const isReusableEmpty = (t) => !!t && !t.path && !t.dirty && t.editor.getMarkdown().trim() === '';
 
-function makeEditor(containerEl){
+function makeEditor(containerEl, tab){
   return new toastui.Editor({
     el: containerEl,
     height: '100%',
@@ -42,19 +42,30 @@ function makeEditor(containerEl){
     previewStyle: 'tab',
     hideModeSwitch: true,          // lock to WYSIWYG; remove this line to allow a raw-markdown tab too
     usageStatistics: false,
-    placeholder: 'Open a markdown file, or just start typing…'
+    placeholder: 'Open a markdown file, or just start typing…',
+    hooks: {
+      // Toast routes BOTH clipboard paste and drag-drop of an image through this one hook. We
+      // persist the blob (assets/ file for a saved tab, else an inline data URI) and call back
+      // with the URL so Toast inserts ![](url) as a normal, undoable, dirty-flipping edit.
+      addImageBlobHook: (blob, callback) => { insertImage(tab, blob, callback); },
+    },
   });
 }
 
 // Build a tab (editor + strip chip) but do not activate it — callers do that once it's filled.
+// `assetsBase` is the per-document image host C# maps (empty for untitled/browser); it lets the
+// editor show a relative assets/ link (which resolves against EdMd.local otherwise) — see
+// absolutizeAssets / relativizeAssets.
 function createEmptyTab(){
   const id = nextTabId++;
   const el = document.createElement('div');
   el.className = 'tabEditor inactive';
   editorHost.appendChild(el);
-  const editor = makeEditor(el);
 
-  const tab = { id, name: '', path: '', dirty: false, editor, el, fileHandle: null };
+  // Create the record before the editor so the image hook (above) can reach the tab it belongs to.
+  const tab = { id, name: '', path: '', dirty: false, editor: null, el, fileHandle: null, assetsBase: '' };
+  const editor = makeEditor(el, tab);
+  tab.editor = editor;
   editor.on('change', () => {
     setDirtyTab(tab, true);
     scheduleSnapshot(); // persist edits for crash recovery (debounced)
@@ -75,7 +86,9 @@ function createEmptyTab(){
 // (which flips the tab dirty); we clear that immediately after — the same pattern the
 // single-document build used.
 function loadContent(tab, content){
-  tab.editor.setMarkdown(content || '', false);
+  // On-disk/persisted content carries relative assets/ links; show them via the tab's absolute
+  // image host so they render in the live editor (no-op when there's no host, e.g. untitled tabs).
+  tab.editor.setMarkdown(absolutizeAssets(content || '', tab.assetsBase), false);
   resetUndoHistory(tab.editor); // the loaded doc is the undo baseline, not an undoable edit
   setDirtyTab(tab, false);
   // Toast parks the caret at the document end after setMarkdown; a freshly opened file should
@@ -86,13 +99,14 @@ function loadContent(tab, content){
 
 // Open a file into a tab: focus it if that path is already open, else reuse a pristine empty
 // tab, else make a new one. Used by desktop `fileOpened`, browser open, and the ?session handoff.
-function openInTab(name, path, content, fileHandle){
+function openInTab(name, path, content, fileHandle, assetsBase){
   const existing = findTabByPath(path);
   if(existing){ activateTab(existing.id); setStatus('Already open: ' + name); return existing; }
   const tab = isReusableEmpty(activeTab()) ? activeTab() : createEmptyTab();
   tab.name = name || '';
   tab.path = path || '';
   tab.fileHandle = fileHandle || null;
+  tab.assetsBase = assetsBase || ''; // set before loadContent so relative links absolutize
   loadContent(tab, content);
   refreshChip(tab);
   activateTab(tab.id);
@@ -187,8 +201,8 @@ function setDirtyTab(tab, v){
 // budgeting when authoring prompts/skills; an exact count would need a model tokenizer.
 function estimateTokens(text){ return Math.max(0, Math.round(text.length / 4)); }
 function updateWordCount(){
-  const ed = activeEditor();
-  const t = ed ? ed.getMarkdown() : '';
+  const tab = activeTab();
+  const t = tab ? tabMarkdown(tab) : '';
   const words = t.trim() ? t.trim().split(/\s+/).length : 0;
   const lines = t ? t.split(/\r\n|\r|\n/).length : 0;
   // Lead with the token estimate — it's the number that matters for AI prompts.
@@ -220,7 +234,19 @@ function dedupeTabsByPath(keep){
 }
 
 // Update a tab after a successful save (name/path may change on a Save As).
-function applySavedToTab(tab, name, path){
+function applySavedToTab(tab, name, path, assetsBase){
+  if(assetsBase !== undefined){
+    const newBase = assetsBase || '';
+    // A Save As into a different folder changes the per-doc image host. Re-point any in-editor
+    // asset URLs from the old host to the new one so a later save still round-trips to a relative
+    // link. (Copying the image FILES across folders is a documented v1 non-goal.)
+    if(tab.assetsBase && newBase && newBase !== tab.assetsBase){
+      const md = tab.editor.getMarkdown();
+      const rebased = absolutizeAssets(relativizeAssets(md, tab.assetsBase), newBase);
+      if(rebased !== md) tab.editor.setMarkdown(rebased, false);
+    }
+    tab.assetsBase = newBase;
+  }
   tab.name = name || tab.name;
   tab.path = path || '';
   setDirtyTab(tab, false);
@@ -243,7 +269,7 @@ function snapshotSession(){
   host.sessionChanged({
     activeIndex,
     tabs: tabs.map(t => ({
-      name: t.name || '', path: t.path || '', dirty: !!t.dirty, content: t.editor.getMarkdown(),
+      name: t.name || '', path: t.path || '', dirty: !!t.dirty, content: tabMarkdown(t),
     })),
   });
 }
@@ -267,6 +293,7 @@ function restoreSession(data){
       tab.name = s.name || '';
       tab.path = s.path || '';
       tab.fileHandle = null;
+      tab.assetsBase = s.assetsBase || ''; // set before loadContent so relative links absolutize
       loadContent(tab, s.content || '');   // clears dirty…
       if(s.dirty) setDirtyTab(tab, true);  // …then re-flag the recovered/unsaved ones
       refreshChip(tab);
@@ -282,6 +309,89 @@ function restoreSession(data){
     restoring = false;
   }
   snapshotSession(); // persist the normalised state (drops any tabs C# couldn't restore)
+}
+
+// ---- Image paste / drag-drop ------------------------------------------------------------
+// A pasted screenshot or a dropped image file. For a saved tab we persist the bytes next to the
+// document (an assets/ file, via the host) and insert a relative link; for an untitled tab — or
+// the browser build, or any save failure — we embed a base64 data URI so the image still appears
+// (inline, travelling inside the buffer, so it survives session restore and Copy).
+const IMAGE_EXT = { 'image/png':'png', 'image/jpeg':'jpg', 'image/gif':'gif', 'image/webp':'webp' };
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024; // mirror the C# cap; reject before we base64 a huge blob
+const imageExtForType = (mime) => IMAGE_EXT[(mime || '').toLowerCase()] || null;
+
+function blobToDataUri(blob){
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error || new Error('read failed'));
+    r.readAsDataURL(blob);
+  });
+}
+// The base64 payload alone (no "data:...;base64," prefix) — what the saveImage bridge wants.
+async function blobToBase64(blob){
+  const uri = await blobToDataUri(blob);
+  return uri.slice(uri.indexOf(',') + 1);
+}
+
+// The editor holds an absolute image URL (so it renders); the .md on disk keeps a relative
+// assets/ link (so it's portable). These convert between the two, anchored on the Markdown
+// image token "](assets/" so a URL that's already absolute (or a web URL) is left untouched.
+// A plain split/join keeps the base — which contains '.' and '/' — out of any regex.
+function absolutizeAssets(content, base){
+  return base ? content.split('](assets/').join('](' + base + 'assets/') : content;
+}
+function relativizeAssets(content, base){
+  return base ? content.split('](' + base + 'assets/').join('](assets/') : content;
+}
+// The tab's Markdown as it should be persisted/emitted: absolute image hosts stripped to
+// relative links. Used everywhere content leaves the editor for disk, snapshot, copy or handoff.
+function tabMarkdown(tab){ return relativizeAssets(tab.editor.getMarkdown(), tab.assetsBase); }
+
+// Image save round-trips, like the save handshake: a request registers a resolver keyed by a
+// per-request id (a tab can have several in flight), and the `imageSaved` reply resolves it.
+const pendingImages = new Map();
+let nextImageReqId = 1;
+function resolveImage(reqId, msg){
+  const r = pendingImages.get(reqId);
+  if(r){ pendingImages.delete(reqId); r(msg); }
+}
+// Ask the host to persist the bytes; resolves the reply ({ok, relPath, assetsBase}) or, when the
+// host can't (browser build, or no response), {ok:false} so the caller falls back to a data URI.
+function requestImageSave(tab, ext, dataBase64){
+  return new Promise((resolve) => {
+    if(!host || !host.saveImage){ resolve({ ok:false }); return; }
+    const reqId = nextImageReqId++;
+    pendingImages.set(reqId, resolve);
+    host.saveImage(reqId, tab.path || '', ext, dataBase64);
+    // Safety net: never let a lost reply hang the insert — degrade to a data URI after a while.
+    setTimeout(() => { if(pendingImages.delete(reqId)) resolve({ ok:false }); }, 15000);
+  });
+}
+
+// Resolve a pasted/dropped blob to a URL and hand it to Toast's callback. On an unsupported type
+// or oversize blob we show a status and DON'T call back, so no broken ![]() is inserted.
+async function insertImage(tab, blob, callback){
+  try{
+    const ext = imageExtForType(blob.type);
+    if(!ext){ setStatus('Unsupported image type — paste a PNG, JPG, GIF or WebP', 5000, true); return; }
+    if(blob.size > MAX_IMAGE_BYTES){ setStatus('That image is too large (max 25 MB)', 5000, true); return; }
+
+    // A saved tab with a known folder → try to persist next to the document.
+    if(tab && tab.path && host && host.saveImage){
+      const res = await requestImageSave(tab, ext, await blobToBase64(blob));
+      if(res && res.ok && res.relPath){
+        if(res.assetsBase) tab.assetsBase = res.assetsBase; // keep the tab's host in sync
+        callback((tab.assetsBase || '') + res.relPath, ''); // absolute in-editor; stripped on save
+        return;
+      }
+      // else fall through to an inline data URI (untitled folder unknown, or the write failed)
+    }
+
+    callback(await blobToDataUri(blob), '');
+  }catch(e){
+    setStatus('Could not insert the image', 5000, true);
+  }
 }
 
 // ---- Host abstraction: WebView2 bridge (desktop) OR File System Access API (Chrome) ----
@@ -325,17 +435,18 @@ if(IS_DESKTOP){
   const requestSave = (type, tab)=> new Promise((resolve)=>{
     resolvePending(tab.id, false);
     pendingSaves.set(tab.id, resolve);
-    send({ type, tabId: tab.id, path: tab.path || '', name: tab.name || '', content: tab.editor.getMarkdown() });
+    send({ type, tabId: tab.id, path: tab.path || '', name: tab.name || '', content: tabMarkdown(tab) });
   });
   window.chrome.webview.addEventListener('message', (event)=>{
     const msg = event.data; // WebView2 auto-parses JSON posted from C#
-    if(msg.type === 'fileOpened') openInTab(msg.name, msg.path, msg.content);
+    if(msg.type === 'fileOpened') openInTab(msg.name, msg.path, msg.content, null, msg.assetsBase);
     else if(msg.type === 'saved'){
       const t = tabById(msg.tabId);
-      if(t) applySavedToTab(t, msg.name, msg.path);
+      if(t) applySavedToTab(t, msg.name, msg.path, msg.assetsBase);
       resolvePending(msg.tabId, true);
     }
     else if(msg.type === 'saveResult'){ resolvePending(msg.tabId, !!msg.ok); if(!msg.ok) setStatus('Save cancelled'); }
+    else if(msg.type === 'imageSaved') resolveImage(msg.reqId, msg); // resolve a pending paste/drop
     else if(msg.type === 'error') setStatus(msg.message, 6000, true);
     else if(msg.type === 'requestSaveForClose') saveAllForClose();
     else if(msg.type === 'restoreSession') restoreSession(msg); // reopen last session's tabs
@@ -359,10 +470,12 @@ if(IS_DESKTOP){
     // browserId (optional) is an Id from the C#-supplied list; omitted = let C# auto-pick.
     openInBrowser: (browserId)=>{
       const t = activeTab(); if(!t) return;
-      send({ type: 'openInBrowser', markdown: t.editor.getMarkdown(), name: t.name || '', path: t.path || '', browserId: browserId || '' });
+      send({ type: 'openInBrowser', markdown: tabMarkdown(t), name: t.name || '', path: t.path || '', browserId: browserId || '' });
       setStatus('Opening in browser…');
     },
     dirtyChanged: (v)=> send({ type: 'dirty', value: !!v }),
+    // Persist a pasted/dropped image next to its document; C# replies with `imageSaved`.
+    saveImage: (reqId, docPath, ext, dataBase64)=> send({ type: 'saveImage', reqId, docPath, ext, dataBase64 }),
     tabClosed: (path)=> send({ type: 'tabClosed', path }), // drop C#'s cached meta for the file
     themeChanged: (dark)=> send({ type: 'theme', dark: !!dark }), // dark-mode the native title bar
     sessionChanged: (data)=> send({ type: 'sessionSnapshot', activeIndex: data.activeIndex, tabs: data.tabs }),
@@ -379,7 +492,7 @@ if(IS_DESKTOP){
   const noApi = ()=> alert('Local file access needs Chrome or Edge (File System Access API).');
   async function writeTo(handle, tab){
     const w = await handle.createWritable();
-    await w.write(tab.editor.getMarkdown());
+    await w.write(tabMarkdown(tab)); // relative asset links on disk (no-op without a host)
     await w.close();
   }
   host = {
@@ -610,8 +723,8 @@ function markdownAsPlainText(){
   return (doc.body.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
 }
 async function doCopy(kind){
-  const ed = activeEditor();
-  const text = kind === 'text' ? markdownAsPlainText() : (ed ? ed.getMarkdown() : '');
+  const t = activeTab();
+  const text = kind === 'text' ? markdownAsPlainText() : (t ? tabMarkdown(t) : '');
   const ok = await copyToClipboard(text);
   setStatus(ok ? `Copied ${kind === 'text' ? 'text' : 'markdown'} (${estimateTokens(text)} tokens)` : 'Copy failed', 2600, !ok);
 }

@@ -68,11 +68,21 @@ public static class AtomicFile
     // Write via a temp file + atomic replace so an interrupted save can't truncate
     // or corrupt the user's existing file. On failure the temp file is cleaned up.
     // The encoding (from DetectEncoding on open) is preserved, BOM and all.
-    public static void WriteAllText(string path, string content, Encoding encoding)
+    public static void WriteAllText(string path, string content, Encoding encoding) =>
+        AtomicWrite(path, tmp => File.WriteAllText(tmp, content, encoding));
+
+    // Binary sibling of WriteAllText, used for pasted/dropped images. Same temp-file +
+    // atomic-replace discipline so a half-written image never appears next to the document.
+    public static void WriteAllBytes(string path, byte[] bytes) =>
+        AtomicWrite(path, tmp => File.WriteAllBytes(tmp, bytes));
+
+    // Write to a sibling temp file, then atomically replace the target (or move into place
+    // if it's new). On any failure the temp file is cleaned up and the error rethrown.
+    private static void AtomicWrite(string path, Action<string> writeTmp)
     {
         string dir = Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".";
         string tmp = Path.Combine(dir, "." + Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N") + ".tmp");
-        File.WriteAllText(tmp, content, encoding);
+        writeTmp(tmp);
         try
         {
             if (File.Exists(path))
