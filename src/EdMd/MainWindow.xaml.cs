@@ -324,6 +324,16 @@ public partial class MainWindow : Window
                     }
                     break;
 
+                case "exportHtml":
+                    // JS built the standalone HTML; write it to a user-chosen .html file.
+                    ExportHtml(GetString(msg, "name"), GetString(msg, "html"));
+                    break;
+
+                case "exportPdf":
+                    // Render the JS-built HTML in an offscreen WebView2 and print it to a PDF.
+                    await ExportPdf(GetString(msg, "name"), GetString(msg, "html"));
+                    break;
+
                 case "theme":
                     // The web UI picked a (light/dark) theme; match the native window title bar so
                     // the OS caption isn't a light strip above a dark editor (and vice versa).
@@ -795,6 +805,102 @@ public partial class MainWindow : Window
         _docs[path] = new DocMeta(encoding, newline, TryGetWriteTimeUtc(path));
         Title = $"{Path.GetFileName(path)} — EdMd";
         await PostToJs(new { type = "fileOpened", name = Path.GetFileName(path), content, path, assetsBase = AssetsBaseFor(path) });
+    }
+
+    // A default export file name from the document's name (its extension swapped for .html/.pdf);
+    // untitled tabs fall back to "document".
+    private static string SuggestExportName(string sourceName, string ext)
+    {
+        string stem = string.IsNullOrWhiteSpace(sourceName)
+            ? "document"
+            : Path.GetFileNameWithoutExtension(sourceName);
+        if (string.IsNullOrWhiteSpace(stem)) stem = "document";
+        return stem + ext;
+    }
+
+    // Write the JS-built standalone HTML document to a user-chosen .html file. UTF-8 (no BOM) —
+    // the document is self-contained (its CSS is inlined), so it opens/prints anywhere.
+    private void ExportHtml(string sourceName, string html)
+    {
+        var dlg = new SaveFileDialog
+        {
+            Filter = "HTML (*.html)|*.html|All files (*.*)|*.*",
+            FileName = SuggestExportName(sourceName, ".html")
+        };
+        if (dlg.ShowDialog() != true)
+            return;
+        try
+        {
+            AtomicFile.WriteAllText(dlg.FileName, html);
+            _ = PostToJs(new { type = "exported", name = Path.GetFileName(dlg.FileName) });
+        }
+        catch (Exception ex)
+        {
+            _ = ReportError($"Couldn't export {Path.GetFileName(dlg.FileName)}: {ex.Message}", ex);
+        }
+    }
+
+    // Export the document to PDF. The main WebView2 hosts the editor UI (toolbar, tabs), so we
+    // can't print it directly; instead render the JS-built standalone HTML in a throwaway
+    // *offscreen* WebView2 (script disabled — it's a static, possibly-untrusted document) and
+    // print that to PDF. The HTML goes via a temp file (deleted afterwards) so the offscreen page
+    // has a real file origin to resolve any data:/blob: images against.
+    private async System.Threading.Tasks.Task ExportPdf(string sourceName, string html)
+    {
+        var dlg = new SaveFileDialog
+        {
+            Filter = "PDF (*.pdf)|*.pdf|All files (*.*)|*.*",
+            FileName = SuggestExportName(sourceName, ".pdf")
+        };
+        if (dlg.ShowDialog() != true)
+            return;
+        string pdfPath = dlg.FileName;
+
+        string tempHtml = Path.Combine(Path.GetTempPath(), "edmd-export-" + Guid.NewGuid().ToString("N") + ".html");
+        CoreWebView2Controller? controller = null;
+        try
+        {
+            await File.WriteAllTextAsync(tempHtml, html, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+
+            var hwnd = new System.Windows.Interop.WindowInteropHelper(this).EnsureHandle();
+            controller = await Browser.CoreWebView2.Environment.CreateCoreWebView2ControllerAsync(hwnd);
+            controller.IsVisible = false;
+            // Give it a page-sized viewport so layout/wrapping is sane before we print.
+            controller.Bounds = new System.Drawing.Rectangle(0, 0, 816, 1056);
+
+            var wv = controller.CoreWebView2;
+            wv.Settings.IsScriptEnabled = false;      // static document — never run script from it
+            wv.Settings.AreDefaultContextMenusEnabled = false;
+
+            var loaded = new System.Threading.Tasks.TaskCompletionSource<bool>();
+            void OnNav(object? s, CoreWebView2NavigationCompletedEventArgs ev)
+            {
+                wv.NavigationCompleted -= OnNav;
+                loaded.TrySetResult(ev.IsSuccess);
+            }
+            wv.NavigationCompleted += OnNav;
+            wv.Navigate(new Uri(tempHtml).AbsoluteUri);
+            if (!await loaded.Task)
+            {
+                await ReportError("Couldn't export PDF: the document failed to render.",
+                    new Exception("offscreen navigation failed"));
+                return;
+            }
+
+            if (await wv.PrintToPdfAsync(pdfPath, null))
+                await PostToJs(new { type = "exported", name = Path.GetFileName(pdfPath) });
+            else
+                await ReportError("Couldn't export PDF.", new Exception("PrintToPdfAsync returned false"));
+        }
+        catch (Exception ex)
+        {
+            await ReportError($"Couldn't export {Path.GetFileName(pdfPath)}: {ex.Message}", ex);
+        }
+        finally
+        {
+            controller?.Close();
+            try { if (File.Exists(tempHtml)) File.Delete(tempHtml); } catch { /* best-effort temp cleanup */ }
+        }
     }
 
     // Persist the JS-supplied session snapshot to session.json (atomic write). C# stays stateless

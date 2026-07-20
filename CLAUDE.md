@@ -97,9 +97,9 @@ HTTP server or other IPC. (`LocalWebServer` exists only for the browser handoff,
   works), `tabClosed` (a `path`, so C# drops that file's cached save metadata), `theme`
   (a `dark` bool, to match the native title bar — see Gotchas), `sessionSnapshot` (the whole
   tab model — `activeIndex` + a `tabs` array of `{name,path,dirty,content}` — for session
-  restore / crash recovery, see below), `saveImage` (`reqId`, `docPath`, `ext`, `dataBase64` —
-  a pasted/dropped image to persist next to a saved doc; see Image paste below), and
-  `readyToClose` (the
+  restore / crash recovery, see below), `exportHtml`/`exportPdf` (both carry the active tab's
+  `name` + a **standalone HTML document string JS built** from the editor's rendered HTML — see
+  "Export" below), and `readyToClose` (the
   close handshake). C# owns the OpenFileDialog (now `Multiselect` — each file opens a
   tab)/SaveFileDialog and the actual `File.ReadAllText`/`WriteAllText`, each wrapped so an
   I/O failure logs + reports rather than crashing. **C# holds no "current file" —** instead
@@ -115,7 +115,8 @@ HTTP server or other IPC. (`LocalWebServer` exists only for the browser handoff,
   `error` (a short message shown red in the footer),
   `requestSaveForClose` (asks JS to save every dirty tab so the window can close),
   `restoreSession` (`activeIndex` + a `tabs` array to rebuild last session's tabs — sent
-  once on load, *always*, even empty, so JS stops holding back snapshots; see below), and
+  once on load, *always*, even empty, so JS stops holding back snapshots; see below),
+  `exported` (a `name` — a successful PDF/HTML export, shown in the footer), and
   `browsers` (the `{id,name}` list of Chromium browsers found on this machine, sent once on
   load to fill the "Open in Browser" dropdown). The JS `message` listener in `app.js` routes
   `saved`/`saveResult` back to the originating tab by `tabId` (resolving that tab's pending
@@ -186,6 +187,16 @@ HTTP server or other IPC. (`LocalWebServer` exists only for the browser handoff,
   App Paths → standard dirs) because open/save needs the File System Access API; only if
   none is found does it fall back to the OS default browser (open/save may be unavailable).
   The handoff carries the *active* tab's markdown/name/path (C# no longer tracks one open doc).
+- **Export to PDF / HTML (`exportHtml`/`exportPdf`):** **JS** builds the standalone HTML document
+  (`buildExportHtml` — the editor's `getHTML()` wrapped in a `.markdown-body` article with an
+  inlined, deliberately *light* print stylesheet, so desktop and browser produce the same output)
+  and hands it to the host. Desktop: `ExportHtml` writes it to a chosen `.html` (via `AtomicFile`);
+  `ExportPdf` can't print the main WebView2 (it hosts the editor chrome), so it renders the HTML in
+  a throwaway **offscreen** `CoreWebView2Controller` (created from `Browser.CoreWebView2.Environment`,
+  `IsVisible=false`, **script disabled** since the document may be untrusted) loaded from a temp
+  file, then `PrintToPdfAsync`. Both report back with `exported`. Browser build (no C#): HTML → a
+  Blob download; PDF → a new window it calls `print()` on ("Save as PDF"). Relative-path images
+  won't resolve in the export (the doc is self-contained) — data:/absolute URLs do.
 - **File associations / double-click:** `OnNavigationCompleted` scans
   `Environment.GetCommandLineArgs()` for `.md`/`.markdown` paths and opens **each** into its
   own tab once the page is ready. This is why open-with works.

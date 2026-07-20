@@ -448,6 +448,7 @@ if(IS_DESKTOP){
     else if(msg.type === 'saveResult'){ resolvePending(msg.tabId, !!msg.ok); if(!msg.ok) setStatus('Save cancelled'); }
     else if(msg.type === 'imageSaved') resolveImage(msg.reqId, msg); // resolve a pending paste/drop
     else if(msg.type === 'error') setStatus(msg.message, 6000, true);
+    else if(msg.type === 'exported') setStatus('Exported ' + (msg.name || 'document')); // C# wrote the PDF/HTML
     else if(msg.type === 'requestSaveForClose') saveAllForClose();
     else if(msg.type === 'restoreSession') restoreSession(msg); // reopen last session's tabs
     else if(msg.type === 'browsers') populateBrowserMenu(msg.list); // installed browsers for the dropdown
@@ -479,6 +480,15 @@ if(IS_DESKTOP){
     tabClosed: (path)=> send({ type: 'tabClosed', path }), // drop C#'s cached meta for the file
     themeChanged: (dark)=> send({ type: 'theme', dark: !!dark }), // dark-mode the native title bar
     sessionChanged: (data)=> send({ type: 'sessionSnapshot', activeIndex: data.activeIndex, tabs: data.tabs }),
+    // Export the rendered document. JS builds the standalone HTML (so desktop + browser produce
+    // the same file); C# owns the Save dialog + disk write, and — for PDF — renders that HTML in
+    // an offscreen WebView2 and prints it to PDF.
+    exportDoc: (kind)=>{
+      const t = activeTab(); if(!t) return;
+      send({ type: kind === 'pdf' ? 'exportPdf' : 'exportHtml',
+             name: t.name || 'untitled', html: buildExportHtml(exportTitle(t), t.editor.getHTML()) });
+      setStatus(kind === 'pdf' ? 'Exporting PDF…' : 'Exporting HTML…');
+    },
   };
   // Hold off snapshots until C# sends restoreSession, so the empty tab we boot with can't
   // overwrite session.json before the previous session is restored. Safety timeout un-gates in
@@ -523,6 +533,30 @@ if(IS_DESKTOP){
       }catch(e){ if(e.name !== 'AbortError') setStatus('Save failed', 6000, true); }
     },
     dirtyChanged: ()=>{}, // browser tracks dirty locally; nothing to mirror
+    // No C# here: build the same standalone HTML and hand it to the browser — a download for
+    // HTML, a print window (Save as PDF from the print dialog) for PDF.
+    exportDoc(kind){
+      const t = activeTab(); if(!t) return;
+      const html = buildExportHtml(exportTitle(t), t.editor.getHTML());
+      if(kind === 'pdf'){
+        const w = window.open('', '_blank');
+        if(!w){ setStatus('Allow pop-ups to export PDF', 5000, true); return; }
+        w.document.write(html);
+        w.document.close();
+        // Wait a tick for layout/images before invoking the print (Save as PDF) dialog.
+        w.addEventListener('load', ()=> setTimeout(()=> w.print(), 150));
+        setStatus('Opening print dialog — choose “Save as PDF”');
+      } else {
+        const base = (t.name || 'untitled').replace(/\.(md|markdown)$/i, '') || 'untitled';
+        const blob = new Blob([html], { type: 'text/html' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = base + '.html';
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(()=> URL.revokeObjectURL(url), 4000);
+        setStatus('Exported ' + base + '.html');
+      }
+    },
   };
   // "Open in Browser" is meaningless when we're already in the browser — hide the whole control.
   const bb = document.getElementById('browserMenu');
@@ -731,6 +765,53 @@ async function doCopy(kind){
 document.getElementById('btnCopy').addEventListener('click', ()=> doCopy('md'));
 document.querySelectorAll('#copyMenu .menu-panel button').forEach(b =>
   b.addEventListener('click', ()=> doCopy(b.dataset.copy)));
+
+// ---- Export (PDF / HTML) ----
+// Build a self-contained, print-friendly HTML document from the editor's rendered HTML. The
+// stylesheet is embedded (no external deps) and deliberately a clean *light* document style —
+// exports are meant to be shared/printed, so a dark editor theme shouldn't bleed huge ink areas
+// into the PDF. Both hosts (desktop C# write/print, browser download/print) use this same output.
+function escapeHtml(s){
+  return String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]));
+}
+// A human title for the exported file: the tab's name without its .md/.markdown extension.
+function exportTitle(tab){
+  const n = (tab && tab.name ? tab.name : '').replace(/\.(md|markdown)$/i, '').trim();
+  return n || 'Untitled';
+}
+const EXPORT_CSS = `
+  :root{color-scheme:light;}
+  html,body{margin:0;}
+  body{background:#fff;color:#1f2328;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    font-size:16px;line-height:1.6;}
+  .markdown-body{max-width:46rem;margin:0 auto;padding:48px 24px;}
+  .markdown-body h1,.markdown-body h2{border-bottom:1px solid #d8dee4;padding-bottom:.3em;}
+  .markdown-body h1,.markdown-body h2,.markdown-body h3,
+  .markdown-body h4,.markdown-body h5,.markdown-body h6{margin-top:1.5em;margin-bottom:.6em;font-weight:600;line-height:1.25;}
+  .markdown-body h1{font-size:2em;} .markdown-body h2{font-size:1.5em;} .markdown-body h3{font-size:1.25em;}
+  .markdown-body p,.markdown-body ul,.markdown-body ol,.markdown-body blockquote,.markdown-body table{margin:0 0 1em;}
+  .markdown-body a{color:#0969da;text-decoration:none;} .markdown-body a:hover{text-decoration:underline;}
+  .markdown-body code{background:#eff1f3;border-radius:6px;padding:.2em .4em;font-size:85%;
+    font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;}
+  .markdown-body pre{background:#f6f8fa;border-radius:8px;padding:16px;overflow:auto;}
+  .markdown-body pre code{background:transparent;padding:0;font-size:90%;}
+  .markdown-body blockquote{border-left:.25em solid #d0d7de;color:#57606a;padding:0 1em;}
+  .markdown-body table{border-collapse:collapse;} .markdown-body table th,.markdown-body table td{border:1px solid #d0d7de;padding:6px 13px;}
+  .markdown-body table th{background:#f6f8fa;}
+  .markdown-body img{max-width:100%;}
+  .markdown-body hr{border:none;border-top:1px solid #d8dee4;margin:1.5em 0;}
+  @media print{ .markdown-body{max-width:none;padding:0;} @page{margin:18mm;} }
+`;
+function buildExportHtml(title, bodyHtml){
+  return '<!DOCTYPE html>\n<html lang="en"><head><meta charset="UTF-8">' +
+    '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+    '<title>' + escapeHtml(title) + '</title><style>' + EXPORT_CSS + '</style></head>' +
+    '<body><article class="markdown-body">' + (bodyHtml || '') + '</article></body></html>';
+}
+document.getElementById('btnExport').addEventListener('click', (e)=>{ e.stopPropagation(); toggleMenu(document.getElementById('exportMenu')); });
+document.querySelectorAll('#exportMenu .menu-panel button').forEach(b =>
+  b.addEventListener('click', ()=>{ closeAllMenus(); if(host.exportDoc) host.exportDoc(b.dataset.export); }));
 
 // ---- Raw markdown view toggle (Toast's markdown mode) ----
 // A global preference, applied to every tab's editor so switching tabs stays consistent.
