@@ -288,6 +288,14 @@ public partial class MainWindow : Window
                     SaveAs(GetTabId(msg), GetString(msg, "path"), GetString(msg, "name"), GetContent(msg));
                     break;
 
+                case "saveImage":
+                    // A pasted/dropped image on a saved tab: write the bytes into the document's
+                    // sibling assets/ folder and reply with the relative link. An untitled tab
+                    // (empty docPath) or any failure replies ok:false, and JS falls back to a
+                    // data URI, so the image still appears — just inline — never on disk here.
+                    await SaveImage(msg);
+                    break;
+
                 case "dirty":
                     _isAnyDirty = msg.TryGetProperty("value", out var dv) && dv.ValueKind == JsonValueKind.True;
                     break;
@@ -544,7 +552,7 @@ public partial class MainWindow : Window
 
         _docs[dlg.FileName] = meta with { WriteTimeUtc = TryGetWriteTimeUtc(dlg.FileName) };
         Title = $"{Path.GetFileName(dlg.FileName)} — EdMd";
-        _ = PostToJs(new { type = "saved", tabId, name = Path.GetFileName(dlg.FileName), path = dlg.FileName });
+        _ = PostToJs(new { type = "saved", tabId, name = Path.GetFileName(dlg.FileName), path = dlg.FileName, assetsBase = AssetsBaseFor(dlg.FileName) });
     }
 
     private async System.Threading.Tasks.Task SaveToPath(int tabId, string path, string content)
@@ -590,13 +598,132 @@ public partial class MainWindow : Window
         }
 
         _docs[path] = meta with { WriteTimeUtc = TryGetWriteTimeUtc(path) };
-        await PostToJs(new { type = "saved", tabId, name = Path.GetFileName(path), path });
+        await PostToJs(new { type = "saved", tabId, name = Path.GetFileName(path), path, assetsBase = AssetsBaseFor(path) });
     }
 
     // Tell JS a save request did NOT write (cancelled dialog or failed write). Success is reported
     // via `saved` instead. The close handshake awaits one of these two per requested save.
     private System.Threading.Tasks.Task PostSaveResult(int tabId, bool ok) =>
         PostToJs(new { type = "saveResult", tabId, ok });
+
+    // Bound a hostile or accidental huge paste. Enforced (from the base64 length) before the
+    // decode allocates the byte[], and again on the decoded bytes.
+    private const long MaxImageBytes = 25L * 1024 * 1024;
+
+    // Persist a pasted/dropped image next to its document. Writes into the document's sibling
+    // assets/ folder (content-addressed name, so a repeat paste reuses one file) and replies with
+    // the relative link + the doc's asset host. An untitled/unknown tab, an out-of-allowlist type,
+    // an oversize paste, or any I/O failure replies ok:false so JS degrades to an inline data URI.
+    private async System.Threading.Tasks.Task SaveImage(JsonElement msg)
+    {
+        int reqId = msg.TryGetProperty("reqId", out var r) && r.ValueKind == JsonValueKind.Number ? r.GetInt32() : 0;
+        string docPath = GetString(msg, "docPath");
+        string ext = GetString(msg, "ext");
+        string dataBase64 = GetString(msg, "dataBase64");
+
+        // Only write next to a document we actually have open (its path is in _docs). An untitled
+        // tab sends an empty docPath and never reaches disk — JS uses a data URI for those.
+        if (string.IsNullOrEmpty(docPath) || !_docs.ContainsKey(docPath) || !ImageStore.IsAllowedExtension(ext))
+        {
+            await PostImageResult(reqId, false, null, null);
+            return;
+        }
+
+        // Size cap from the base64 length (≈4/3 of the byte count) before the decode allocates.
+        if ((long)dataBase64.Length / 4 * 3 > MaxImageBytes)
+        {
+            await ReportError("That image is too large (max 25 MB).", new InvalidOperationException("image over size cap"));
+            await PostImageResult(reqId, false, null, null);
+            return;
+        }
+
+        byte[] bytes;
+        try { bytes = Convert.FromBase64String(dataBase64); }
+        catch (FormatException) { await PostImageResult(reqId, false, null, null); return; }
+
+        if (bytes.LongLength > MaxImageBytes)
+        {
+            await ReportError("That image is too large (max 25 MB).", new InvalidOperationException("image over size cap"));
+            await PostImageResult(reqId, false, null, null);
+            return;
+        }
+
+        try
+        {
+            string dir = ImageStore.AssetsDirFor(docPath);
+            Directory.CreateDirectory(dir);
+
+            // Content-addressed dedupe: if a file with this content hash already exists (whatever
+            // its timestamp prefix), reuse it rather than writing a second copy.
+            string hash = ImageStore.ContentHash(bytes);
+            string? existing = Directory.EnumerateFiles(dir, ImageStore.DedupeGlob(hash, ext)).FirstOrDefault();
+            string name = existing != null
+                ? Path.GetFileName(existing)!
+                : ImageStore.BuildFileName(bytes, ext, DateTime.UtcNow);
+            if (existing == null)
+                AtomicFile.WriteAllBytes(Path.Combine(dir, name), bytes);
+
+            await PostImageResult(reqId, true, ImageStore.RelativeLink(name), AssetsBaseFor(docPath));
+        }
+        catch (Exception ex)
+        {
+            await ReportError("Couldn't save the pasted image: " + ex.Message, ex);
+            await PostImageResult(reqId, false, null, null);
+        }
+    }
+
+    private System.Threading.Tasks.Task PostImageResult(int reqId, bool ok, string? relPath, string? assetsBase) =>
+        PostToJs(ok
+            ? new { type = "imageSaved", reqId, ok = true, relPath, assetsBase }
+            : (object)new { type = "imageSaved", reqId, ok = false });
+
+    // The WebView2 is pinned to https://EdMd.local (mapped to wwwroot), so a relative image link
+    // like assets/img-….png would resolve against wwwroot and 404 in the live editor. To make a
+    // document's own images render, we map its folder to a distinct per-folder virtual host and
+    // hand JS that host as an absolute base; JS shows images from it while keeping the on-disk link
+    // relative (portable). Only image subresources use it — CSP img-src allows any https: host, and
+    // NavigationStarting still blocks top-level navigation to anything but EdMd.local.
+    private readonly HashSet<string> _assetHosts = new(StringComparer.OrdinalIgnoreCase);
+
+    // The absolute https base ("https://<host>/") for a document's directory, mapping the folder to
+    // a virtual host on first use. Returns "" if there's no directory to map (defensive).
+    private string AssetsBaseFor(string docPath)
+    {
+        string? dir;
+        try { dir = Path.GetDirectoryName(Path.GetFullPath(docPath)); }
+        catch { return ""; }
+        if (string.IsNullOrEmpty(dir))
+            return "";
+
+        // Host derived from the (case-folded) folder path, so the same folder always maps to the
+        // same host and an attacker can't guess another document's host. Prefixed with a letter so
+        // the leading label is never a digit.
+        string host = "a" + ShortHash(dir.ToLowerInvariant()) + ".edmdassets.local";
+        if (_assetHosts.Add(host))
+        {
+            try
+            {
+                Browser.CoreWebView2.SetVirtualHostNameToFolderMapping(
+                    host, dir, CoreWebView2HostResourceAccessKind.Allow);
+            }
+            catch (Exception ex)
+            {
+                // A missing/renamed folder (e.g. a recovered tab whose file is gone) just won't map;
+                // the image shows broken, which is the honest outcome. Don't crash over it.
+                Log.Write("SetVirtualHostNameToFolderMapping failed for " + dir + ": " + ex);
+            }
+        }
+        return "https://" + host + "/";
+    }
+
+    // 16 hex chars of SHA-256 — enough to make per-folder host collisions negligible.
+    private static string ShortHash(string s)
+    {
+        byte[] hash = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(s));
+        var sb = new StringBuilder(16);
+        for (int i = 0; i < 8; i++) sb.Append(hash[i].ToString("x2"));
+        return sb.ToString();
+    }
 
     // The file's current last-write time in UTC, or null if it's missing/unreadable. Used as the
     // baseline for detecting an external edit before an overwrite.
@@ -677,7 +804,7 @@ public partial class MainWindow : Window
 
         _docs[path] = new DocMeta(encoding, newline, TryGetWriteTimeUtc(path));
         Title = $"{Path.GetFileName(path)} — EdMd";
-        await PostToJs(new { type = "fileOpened", name = Path.GetFileName(path), content, path });
+        await PostToJs(new { type = "fileOpened", name = Path.GetFileName(path), content, path, assetsBase = AssetsBaseFor(path) });
     }
 
     // A default export file name from the document's name (its extension swapped for .html/.pdf);
@@ -869,21 +996,21 @@ public partial class MainWindow : Window
                 _docs[t.Path] = new DocMeta(encoding, AtomicFile.DetectNewline(disk), TryGetWriteTimeUtc(t.Path));
                 // Clean tab shows the current file; a dirty tab keeps its recovered edits.
                 string content = t.Dirty ? t.Content : disk;
-                outTabs.Add(new { name = t.Name, path = t.Path, content, dirty = t.Dirty });
+                outTabs.Add(new { name = t.Name, path = t.Path, content, dirty = t.Dirty, assetsBase = AssetsBaseFor(t.Path) });
             }
             catch (Exception ex)
             {
                 Log.Write("RestoreSession couldn't read " + t.Path + ": " + ex);
                 // Preserve unsaved edits even if the file can't be read; drop clean tabs.
                 if (t.Dirty)
-                    outTabs.Add(new { name = t.Name, path = t.Path, content = t.Content, dirty = true });
+                    outTabs.Add(new { name = t.Name, path = t.Path, content = t.Content, dirty = true, assetsBase = AssetsBaseFor(t.Path) });
             }
         }
         else if (t.Dirty)
         {
             // File is gone but there are unsaved edits — recover them (the path is kept so a save
             // re-targets the original location; if its folder is gone the save reports the error).
-            outTabs.Add(new { name = t.Name, path = t.Path, content = t.Content, dirty = true });
+            outTabs.Add(new { name = t.Name, path = t.Path, content = t.Content, dirty = true, assetsBase = AssetsBaseFor(t.Path) });
         }
         // saved + clean + missing → nothing to lose, drop it.
     }

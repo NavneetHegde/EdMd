@@ -54,9 +54,11 @@ dotnet test        # from src/EdMd.Tests/ or the repo root
 ```
 They cover the pure/security-sensitive C# logic: `LocalWebServer` (static file serving,
 MIME, 404/405, the `/__session` token gate, and path-traversal blocking), `AtomicFile`
-(the temp-file+atomic-replace write), `MarkdownFile` (the `.md`/`.markdown` extension
-gate for command-line opens and single-instance forwarding), and `SessionStore`
-(the session-restore serialize/round-trip + tolerant parse of a corrupt session file). GUI/bridge code (tabs,
+(the temp-file+atomic-replace write, text and binary), `MarkdownFile` (the `.md`/`.markdown`
+extension gate for command-line opens and single-instance forwarding), `SessionStore`
+(the session-restore serialize/round-trip + tolerant parse of a corrupt session file), and
+`ImageStore` (the image-paste MIME→ext allowlist, content-addressed filename + hash dedupe,
+and relative-link helpers). GUI/bridge code (tabs,
 single-instance plumbing, the WebView2 bridge) and the front-end JS are not covered. There is no linter or CI. `EdMd.slnx` at the repo root is the (XML) solution
 file (now lists both projects). Note the project file is `EdMd.csproj` but `AssemblyName` is
 `EdMd`, so the built/published binary is **`EdMd.exe`** — installer and
@@ -106,9 +108,11 @@ HTTP server or other IPC. (`LocalWebServer` exists only for the browser handoff,
   `save` with an empty `path` falls through to Save As. `SaveAs`/`SaveToPath` report their
   outcome to the tab (see `saved`/`saveResult` below) rather than returning a bool.
 - **C# → JS (`PostToJs`):** C# pushes `{type}` messages back —
-  `fileOpened` (name + content + full `path` → opens/reuses a tab), `saved` (`tabId` +
-  name + full `path` — a successful write), `saveResult` (`tabId` + `ok:false` — a cancelled
-  dialog or failed write), `error` (a short message shown red in the footer),
+  `fileOpened` (name + content + full `path` + `assetsBase` → opens/reuses a tab), `saved`
+  (`tabId` + name + full `path` + `assetsBase` — a successful write), `saveResult` (`tabId` +
+  `ok:false` — a cancelled dialog or failed write), `imageSaved` (`reqId` + `ok` + `relPath` +
+  `assetsBase`, or `ok:false` — the reply to `saveImage`; see Image paste below),
+  `error` (a short message shown red in the footer),
   `requestSaveForClose` (asks JS to save every dirty tab so the window can close),
   `restoreSession` (`activeIndex` + a `tabs` array to rebuild last session's tabs — sent
   once on load, *always*, even empty, so JS stops holding back snapshots; see below),
@@ -141,6 +145,32 @@ HTTP server or other IPC. (`LocalWebServer` exists only for the browser handoff,
   suppresses snapshots (`restoring` flag) until `restoreSession` arrives — otherwise the empty tab
   it boots with would clobber the file first; a 3s safety timeout un-gates if the message never
   comes. `restoreSession` is therefore always sent, even for an empty/absent session.
+- **Image paste / drag-drop (`saveImage` → `SaveImage`):** Toast's single `addImageBlobHook`
+  intercepts both clipboard paste and file drop and hands JS the image `Blob`; `insertImage`
+  (in `app.js`) resolves it to a URL and calls Toast's `callback(url,'')` so the insert is a
+  normal, undoable, dirty-flipping edit. **A saved tab** persists the bytes next to its doc:
+  JS posts `saveImage` (base64) and C# `SaveImage` re-validates the ext against `ImageStore`'s
+  allowlist (`png/jpg/gif/webp` — **no SVG**), enforces a 25 MB cap *before* the base64 decode,
+  writes into a sibling `assets/` folder via `AtomicFile.WriteAllBytes` under a content-addressed
+  name (`img-<ts>-<hash8>.<ext>`; a matching hash is **reused**, so a repeat paste dedupes to one
+  file), and replies `imageSaved` with the relative `assets/…` link. **An untitled tab** (empty
+  `docPath`), the browser build, or any failure gets `ok:false` and JS falls back to an inline
+  base64 **data URI** (so the image still renders and travels inside the buffer). The pure,
+  security-sensitive bits (MIME→ext, filename, hash, dedupe glob, assets-dir, relative link) live
+  in the unit-tested `ImageStore.cs`; only the disk write + bridge glue are in `MainWindow`.
+  **Rendering (the non-obvious part):** the editor page is served from `EdMd.local` (mapped to
+  `wwwroot`), so a *relative* `assets/…` link would 404 in the live WYSIWYG surface — Toast renders
+  images from the node's `imageUrl`, which is *also* what `getMarkdown` serializes, so there's no
+  separate "display src." So C# maps each document's folder to a **per-folder virtual host**
+  (`AssetsBaseFor` → `a<hash>.edmdassets.local`, allowed by CSP's `img-src https:`) and hands JS
+  that absolute base as `assetsBase` on `fileOpened`/`saved`/`restoreSession`/`imageSaved`. JS keeps
+  the editor content **absolute** (so images render) but converts to/from **relative** at every
+  persistence boundary via `absolutizeAssets`/`relativizeAssets` (anchored on the `](assets/`
+  token) — `tabMarkdown(tab)` is the relativised markdown used for save, snapshot, copy, and the
+  browser handoff, while `loadContent` absolutises on the way in. So the `.md` on disk stays
+  portable (relative links render on GitHub/other editors) while the live editor shows the image.
+  Non-goals (v1): image resize/compress, alt-text prompts, re-linking on rename/move (a Save As to
+  a *different* folder re-points the in-editor URLs but does **not** copy the image files).
 - **Open in Browser (`openInBrowser` → `OpenInBrowserEditor`):** opens the *full*
   editor in Chrome, pre-loaded with the current document — not a static preview. C#
   lazily starts `LocalWebServer` (an in-process loopback `TcpListener` on an ephemeral
