@@ -430,13 +430,17 @@ function loadMermaid(){
     s.onload = () => resolve(window.mermaid);
     s.onerror = () => reject(new Error('could not load the diagram renderer'));
     document.head.appendChild(s);
-  }).then((m) => { m.initialize(mermaidConfig()); return m; });
+  }).then((m) => { m.initialize(mermaidConfig()); return m; })
+    // Don't let one failed load poison the session: forget it so the next diagram retries
+    // (the current waiters still get the rejection).
+    .catch((e) => { mermaidLoading = null; throw e; });
   return mermaidLoading;
 }
 
-const mermaidCache = new Map();   // diagram source → { svg } or { error }
+const mermaidCache = new Map();   // diagram source → { svg, id } or { error }
 const mermaidWanted = new Map();  // diagram source → the Set of elements waiting on it
 let mermaidTimer = null;
+let mermaidPaintSeq = 0;          // makes each painted copy's element id unique (see below)
 
 // Show what we know about `source` in one container. A miss queues a render and leaves a
 // placeholder; the queue paints the element itself once mermaid answers.
@@ -445,7 +449,12 @@ function paintMermaid(el, source){
   const hit = mermaidCache.get(source);
   if(hit && hit.svg){
     el.classList.remove('is-error');
-    el.innerHTML = hit.svg; // mermaid's own output, sanitized by its strict security level
+    // The cached markup carries the id it was rendered under, and mermaid scopes the <style>
+    // block it embeds to that id — so the same diagram twice in one document would paint two
+    // elements with one id (invalid, and it breaks getElementById). Swap in a fresh id
+    // everywhere it appears, keeping the SVG and its stylesheet pointing at each other.
+    const fresh = 'edmd-mmd-' + (++mermaidPaintSeq);
+    el.innerHTML = hit.svg.split(hit.id).join(fresh); // mermaid's own output, sanitized by its strict security level
     return;
   }
   if(hit && hit.error){
@@ -487,8 +496,9 @@ async function runMermaidQueue(){
   }
   for(const [source, els] of live){
     try{
-      const { svg } = await mermaid.render('edmd-mermaid-' + (++mermaidSeq), source);
-      cacheMermaid(source, { svg });
+      const renderId = 'edmd-mermaid-' + (++mermaidSeq);
+      const { svg } = await mermaid.render(renderId, source);
+      cacheMermaid(source, { svg, id: renderId });
       for(const el of els) if(el.isConnected) paintMermaid(el, source);
     }catch(e){
       // Mermaid's message points at the offending line with a caret, compiler-style — worth
@@ -970,8 +980,17 @@ function locateOffset(map, offset){
 // Flatten a root's text nodes into one string plus a {node,start} map so a match offset
 // in the string can be mapped back to a DOM position (see locateOffset). Used for both
 // highlighting and DOM-range replace, so the two always see the same text.
+//
+// Rendered mermaid diagrams are skipped: they're view-only widget decorations living inside
+// .ProseMirror, so their SVG label text is NOT in the document. Counting it would inflate the
+// match count (the diagram's source, in the code block, is already matched on its own) and let
+// a match run from document text into non-editable DOM, which replace can't write to.
 function domTextAndMap(root){
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  const skipWidgets = !!root.querySelector('.edmd-mermaid'); // only pay for the check when needed
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, skipWidgets ? {
+    acceptNode: (n) => (n.parentElement && n.parentElement.closest('.edmd-mermaid'))
+      ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+  } : null);
   let text = ''; const map = []; let n;
   while((n = walker.nextNode())){ map.push({ node: n, start: text.length }); text += n.data; }
   return { text, map };
