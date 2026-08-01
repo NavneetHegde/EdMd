@@ -64,4 +64,51 @@ public static class ImageStore
     // The relative Markdown link to embed — always forward-slashed (Markdown, not Windows paths)
     // and always inside the document's own directory (no absolute path, no "..").
     public static string RelativeLink(string fileName) => "assets/" + fileName;
+
+    // The Content-Type to serve a stored image as. Only the allowlisted extensions are known; an
+    // unknown one gets the generic octet-stream (it is never reached — callers gate on the
+    // allowlist first — but it keeps the method total).
+    public static string MimeForExtension(string? ext)
+    {
+        foreach (var pair in MimeToExt)
+            if (string.Equals(pair.Value, ext, StringComparison.OrdinalIgnoreCase))
+                return pair.Key;
+        return "application/octet-stream";
+    }
+
+    // Resolve the URL path of an editor image request — the part after the folder id, i.e.
+    // "assets/img-….png" relative to the document's folder — to the file on disk to serve, or
+    // null if it must not be served.
+    // This is the security gate for the asset origin: the resolved path must stay inside the
+    // document's own assets/ folder (so "../../secret.png" or a rooted path is refused) and must
+    // name an allowlisted image type (so the origin can't be used to read arbitrary files).
+    public static string? ResolveAssetRequest(string docDir, string? urlPath)
+    {
+        if (string.IsNullOrEmpty(docDir) || string.IsNullOrEmpty(urlPath))
+            return null;
+
+        // A backslash in a URL path would be a separator on Windows — treat it as one so it can't
+        // sneak past the containment check below.
+        string relative = urlPath.Replace('/', Path.DirectorySeparatorChar)
+                                 .Replace('\\', Path.DirectorySeparatorChar);
+
+        string assetsDir, full;
+        try
+        {
+            string root = Path.GetFullPath(docDir);
+            assetsDir = Path.GetFullPath(Path.Combine(root, "assets"));
+            full = Path.GetFullPath(Path.Combine(root, relative));
+        }
+        catch
+        {
+            return null; // invalid characters, too long, etc.
+        }
+
+        // Containment: the resolved file must live under <doc folder>\assets\ (Path.Combine with a
+        // rooted "relative" would otherwise discard assetsDir entirely).
+        if (!full.StartsWith(assetsDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        return IsAllowedExtension(Path.GetExtension(full).TrimStart('.')) ? full : null;
+    }
 }

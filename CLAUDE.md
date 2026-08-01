@@ -58,8 +58,12 @@ MIME, 404/405, the `/__session` token gate, and path-traversal blocking), `Atomi
 extension gate for command-line opens and single-instance forwarding), `SessionStore`
 (the session-restore serialize/round-trip + tolerant parse of a corrupt session file), and
 `ImageStore` (the image-paste MIME→ext allowlist, content-addressed filename + hash dedupe,
-and relative-link helpers). GUI/bridge code (tabs,
-single-instance plumbing, the WebView2 bridge) and the front-end JS are not covered. There is no linter or CI. `EdMd.slnx` at the repo root is the (XML) solution
+relative-link helpers, and `ResolveAssetRequest` — the containment/allowlist gate the asset
+origin serves images through). GUI/bridge code (tabs,
+single-instance plumbing, the WebView2 bridge) and the front-end JS are not covered. There is no
+linter, but CI does run: `.github/workflows/ci.yml` (`build-test`) restores/builds/tests
+`EdMd.slnx` in Release on `windows-latest` for every push to `main` and every PR;
+`release.yml` is the other workflow. `EdMd.slnx` at the repo root is the (XML) solution
 file (now lists both projects). Note the project file is `EdMd.csproj` but `AssemblyName` is
 `EdMd`, so the built/published binary is **`EdMd.exe`** — installer and
 manifest references depend on that name; don't "fix" the mismatch.
@@ -161,9 +165,20 @@ HTTP server or other IPC. (`LocalWebServer` exists only for the browser handoff,
   **Rendering (the non-obvious part):** the editor page is served from `EdMd.local` (mapped to
   `wwwroot`), so a *relative* `assets/…` link would 404 in the live WYSIWYG surface — Toast renders
   images from the node's `imageUrl`, which is *also* what `getMarkdown` serializes, so there's no
-  separate "display src." So C# maps each document's folder to a **per-folder virtual host**
-  (`AssetsBaseFor` → `a<hash>.edmdassets.local`, allowed by CSP's `img-src https:`) and hands JS
-  that absolute base as `assetsBase` on `fileOpened`/`saved`/`restoreSession`/`imageSaved`. JS keeps
+  separate "display src." So C# serves each document's images from **one fixed asset origin**,
+  `https://edmd-assets.local/<folder id>/` (`AssetsBaseFor`, allowed by CSP's `img-src https:`),
+  and hands JS that absolute base as `assetsBase` on
+  `fileOpened`/`saved`/`restoreSession`/`imageSaved`. That origin is **not** a virtual host
+  mapping: `MainWindow_Loaded` registers an `AddWebResourceRequestedFilter` +
+  `WebResourceRequested` handler (`OnAssetRequested`) *before* the navigation, and the handler
+  streams the file off disk. **Don't "simplify" this back to a per-folder
+  `SetVirtualHostNameToFolderMapping`** — a mapping added *after* the page has navigated does not
+  reach the already-loaded document (it only starts working if some later CoreWebView2 call happens
+  to flush it), and document folders are only known once a file is opened/saved, i.e. always after
+  navigation; that was the bug where every pasted image rendered broken. `_assetFolders` maps the
+  id (a hash of the folder path) back to the directory, and `ImageStore.ResolveAssetRequest` is the
+  gate that keeps a request inside that document's own `assets/` folder and on the image
+  allowlist — anything else gets a 404. JS keeps
   the editor content **absolute** (so images render) but converts to/from **relative** at every
   persistence boundary via `absolutizeAssets`/`relativizeAssets` (anchored on the `](assets/`
   token) — `tabMarkdown(tab)` is the relativised markdown used for save, snapshot, copy, and the
@@ -239,6 +254,39 @@ the browser never exposes a file's full path (so the footer shows the name there
   It is deliberately not loaded from a CDN — the editor JS runs in the WebView2 that
   can write files, so a floating CDN version is a code-execution risk. Upgrading
   means re-downloading the three files and bumping the version note in `index.html`.
+- **Mermaid diagrams (`app.js`, "Mermaid diagrams" section):** a ` ```mermaid ` code block keeps
+  its source and gets the rendered SVG shown underneath it, **in WYSIWYG only**. It is a
+  ProseMirror **widget decoration** (via a Toast plugin's `wysiwygPlugins`), deliberately *not* a
+  `wysiwygNodeViews.codeBlock`: node views are keyed by node type, so registering one would
+  replace Toast's own code-block view (language chip, editing) for *every* language. Decorations
+  are view-only, so `getMarkdown()` — and therefore save, session snapshot, copy and the browser
+  handoff — round-trips the document byte-for-byte. Toast hands plugins the ProseMirror classes
+  (`Plugin`, `Decoration`, `DecorationSet`) on the plugin `context`; there is no other route to
+  them from the bundle. Mermaid (v11.16.0) is **vendored** under `wwwroot/vendor/mermaid/` for the
+  same reason Toast is, but it is ~3.5 MB, so `loadMermaid()` injects the `<script>` lazily the
+  first time a diagram is on screen rather than at startup (`script-src 'self'` still covers it).
+  Renders are debounced (`MERMAID_DEBOUNCE_MS`) and cached by source, half-typed sources are
+  skipped by checking `el.isConnected`, mermaid runs at `securityLevel: 'strict'` with
+  `suppressErrorRendering` (a bad diagram gets EdMd's own error box, not mermaid's graphic), and a
+  theme change re-initializes + repaints because mermaid bakes colors into the SVG.
+- **Offline by design — keep it that way.** EdMd never makes a network request: every asset is
+  on disk behind the `EdMd.local` virtual host (Toast and Mermaid are vendored, never CDN),
+  Toast's `usageStatistics` is `false` (that flag is what gates its google-analytics beacon), the
+  only `fetch` in `app.js` is the same-origin `/__session` handoff, and `LocalWebServer` binds
+  `IPAddress.Loopback`. The CSP allows **no remote origin at all** — in particular `img-src` lists
+  only `'self' data: blob: https://edmd-assets.local`, so an opened `.md` cannot pull a remote
+  image (a tracking pixel would otherwise report that you opened the document). Adding a CDN
+  `<script>`/`<link>`, a web font, or a permissive `img-src` would undo this.
+  The *Chromium engine* underneath is the other half: `CreateOfflineEnvironment` passes
+  `AdditionalBrowserArguments` (`--disable-background-networking`, `--disable-component-update`,
+  `--disable-domain-reliability`, `--no-pings`, `--host-resolver-rules=…~NOTFOUND`, a
+  `--disable-features=…` list) plus `IsCustomCrashReportingEnabled` and
+  `AllowSingleSignOnUsingOSPrimaryAccount=false`, instead of the default environment. Measured: a
+  bare WebView2 host opens 3 background connections to Microsoft; EdMd with these options opens 2.
+  The residual pair is the runtime's own Windows-account/SSO probe (`login.live.com`,
+  `login.microsoftonline.com`) made through the **OS** stack, not Chromium's — no in-process
+  switch stops it, and it carries no document data. Blocking it takes a WebView2/Edge policy or a
+  firewall rule, outside the app.
 - **Security model:** the WebView2 is pinned to the `EdMd.local` origin.
   `NavigationStarting`/`NewWindowRequested` cancel any off-origin navigation and open
   such links in the OS browser; `OnWebMessageReceived` checks `e.Source` before

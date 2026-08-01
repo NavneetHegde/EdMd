@@ -8,9 +8,14 @@
      means injected inline scripts / on* handlers can't run even if they survive rendering;
      the app's own JS lives in app.js (no inline script). style-src keeps 'unsafe-inline'
      because the theming relies on an inline <style> block + inline style attributes, which
-     are not a script-execution vector. img-src is permissive so document images still render;
-     connect-src 'self' allows the browser build's /__session fetch. No 'unsafe-eval'. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+     are not a script-execution vector. connect-src 'self' allows the browser build's /__session
+     fetch. No 'unsafe-eval'.
+     img-src deliberately lists NO remote origin: EdMd is an offline editor, and a permissive
+     img-src would let any opened .md fetch a remote image — i.e. announce to that server that
+     you opened the document (IP, timing), which is how tracking pixels work. Local images
+     (data:/blob: pastes, and the desktop build's per-document assets host) still render; a
+     document that links a picture on the web shows a broken image instead. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://edmd-assets.local; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <!-- Never send a Referer to external resources (e.g. a document's remote <img>), so the
      page URL — which briefly carries the ?session token in the browser handoff — can't leak. -->
 <meta name="referrer" content="no-referrer">
@@ -25,6 +30,9 @@
      class does nothing and the toolbar icons render dark-on-dark (invisible). -->
 <link rel="stylesheet" href="vendor/toastui/toastui-editor-dark.min.css" />
 <script src="vendor/toastui/toastui-editor-all.min.js"></script>
+<!-- Mermaid (v11.16.0) is vendored under vendor/mermaid/ for the same reason, but is NOT
+     loaded here: it's ~3.5 MB, so app.js injects the <script> lazily the first time a
+     ```mermaid block is on screen (see loadMermaid). script-src 'self' still covers it. -->
 <style>
   :root{
     --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
@@ -160,7 +168,10 @@
   /* Re-skin Toast UI Editor to track the theme variables, and hide the raw-markdown
      mode tab since we want pure inline (WYSIWYG) editing, not a mode switch. */
   .toastui-editor-defaultUI{border:none;}
-  .toastui-editor-defaultUI-toolbar{background:var(--panel) !important;border-bottom:1px solid var(--border) !important;}
+  /* Centre the formatting buttons over the (centred) reading column instead of letting
+     them hug the left edge. The toolbar is already flex, so this is just its main axis. */
+  .toastui-editor-defaultUI-toolbar{background:var(--panel) !important;border-bottom:1px solid var(--border) !important;
+    justify-content:center;}
   .toastui-editor-mode-switch{display:none !important;}
   .toastui-editor-main{background:var(--bg) !important;}
   /* Center the text in a readable column (see --read-col / the reading-width control).
@@ -170,6 +181,15 @@
   .ProseMirror{color:var(--text) !important;line-height:1.7;font-size:15px;
     padding-top:24px;padding-bottom:24px;
     padding-inline:max(40px, calc((100% - var(--read-col, 46rem)) / 2)) !important;}
+  /* Rendered ```mermaid diagrams: a read-only card under the code block that holds the
+     source (see the mermaid section in app.js). Inside .ProseMirror, so it inherits the
+     reading-column padding and the zoom level like any other block. */
+  .edmd-mermaid{margin:-4px 0 16px;padding:12px;border:1px solid var(--border);border-radius:8px;
+    background:var(--panel);overflow-x:auto;text-align:center;
+    color:var(--muted);font-size:13px;user-select:none;}
+  .edmd-mermaid svg{max-width:100%;height:auto;}
+  .edmd-mermaid.is-error{text-align:left;white-space:pre-wrap;color:#e5534b;
+    font-family:var(--mono);font-size:12px;}
   /* Zoom the WHOLE editor content area uniformly — text, headings, code, images,
      tables, spacing — not just the base font. `zoom` reflows so it always fills
      100% of the editor area at any level. Applies to WYSIWYG surface AND preview. */
