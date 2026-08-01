@@ -28,3 +28,27 @@ jobs:
 
       - name: Test
         run: dotnet test EdMd.slnx -c Release --no-build
+
+      # ---- SBOM (CycloneDX 1.7) ----
+      # A software bill of materials for the whole solution, published with the run so a
+      # build can be audited for vulnerable/licensed dependencies after the fact.
+      # NOTE: --spec-version picks the CycloneDX version; the similar-looking -sv is
+      # --set-version (the metadata component version). Don't swap them.
+      - name: Install CycloneDX tool
+        run: dotnet tool install --global CycloneDX
+
+      - name: Generate SBOM
+        run: >
+          dotnet CycloneDX EdMd.slnx
+          --spec-version 1.7
+          --output-format Json
+          --set-name EdMd
+          --set-version ${{ github.sha }}
+          --output sbom
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom-cyclonedx-1.7
+          path: sbom/bom.json
+          if-no-files-found: error
