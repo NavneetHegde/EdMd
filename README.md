@@ -157,7 +157,7 @@ the run, no Release).
 
 ### Signing
 
-Releases are signed with a **self-signed** `CN=EdMd` certificate (`SIGNING_MODE=selfsigned`,
+Releases are signed with a **self-signed** `CN=EdMd` certificate (CI reads the key from the
 secrets `SELFSIGN_PFX_BASE64` / `SELFSIGN_PFX_PASSWORD`), which is why the MSIX needs the
 one-time trust step [above](#msix-installer-recommended).
 

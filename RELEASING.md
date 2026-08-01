@@ -43,27 +43,16 @@ To rehearse without publishing: **Actions → Release → Run workflow** (or
 `gh workflow run release.yml -f version=0.2.0`). This uploads the exe + MSIX as *run
 artifacts* only — no Release is created.
 
-## Signing modes
+## Signing
 
-The repo variable **`SIGNING_MODE`** selects how the MSIX is signed:
+The MSIX is signed with the committed **`CN=EdMd` self-signed** certificate. CI reads the key
+from the secrets `SELFSIGN_PFX_BASE64` and `SELFSIGN_PFX_PASSWORD`; the public `.cer` ships
+with the release so users can trust it once (the step is in the README).
 
-| Mode | Cert | End-user trust step | Needs |
-|------|------|---------------------|-------|
-| `selfsigned` (current) | committed `CN=EdMd` self-signed | **Yes** — import `edmd-codesign.cer` once (see README) | secrets `SELFSIGN_PFX_BASE64`, `SELFSIGN_PFX_PASSWORD` |
-| `signpath` (target) | SignPath Foundation OV (publicly trusted) | **No** | `SIGNPATH_API_TOKEN` (secret) + vars `SIGNPATH_ORG_ID`, `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_POLICY_SLUG`, `SIGNPATH_PUBLISHER` |
-
-### SignPath cutover (removes the per-user trust step)
-
-Once the [SignPath Foundation](https://signpath.org) application is approved:
-
-1. Set the `SIGNPATH_*` repo variables (the **`SIGNPATH_PUBLISHER`** must equal the SignPath
-   certificate Subject exactly — it becomes the MSIX `Identity/Publisher`).
-2. Add the `SIGNPATH_API_TOKEN` secret.
-3. Finalize the `Sign with SignPath` step's `artifact-configuration-slug` in
-   `release.yml` against your SignPath project config.
-4. Flip the mode: `gh variable set SIGNING_MODE --body signpath`.
-5. Cut the next tag. Verify with `signtool verify /pa` that the chain is publicly trusted
-   (no local import needed) on a clean machine.
+Because the certificate isn't publicly trusted, that one-time import is required before the
+MSIX will install. Moving to a publicly-trusted code-signing certificate would remove it: the
+signing step in [`release.yml`](.github/workflows/release.yml) is a single `build.ps1` call, and
+`Identity/Publisher` in the manifest must equal the new certificate's Subject exactly.
 
 > Losing/rotating the signing cert breaks in-place upgrades for existing installs (they'd
 > have to uninstall first). Keep an offline backup of `certs/edmd-codesign.pfx` + password.

@@ -22,10 +22,6 @@ concurrency:
 jobs:
   release:
     runs-on: windows-latest
-    env:
-      # Repo variable toggles the signing branch: 'selfsigned' (interim) or 'signpath'.
-      # Defaults to self-signed until SignPath Foundation onboarding is complete.
-      SIGNING_MODE: ${{ vars.SIGNING_MODE || 'selfsigned' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -68,11 +64,11 @@ jobs:
           Compress-Archive -Path "$stage/*" `
             -DestinationPath "dist/EdMd-${{ steps.ver.outputs.semver }}-win-x64.zip" -Force
 
-      # ---- MSIX (interim): sign with the committed self-signed cert via a secret ----
-      # Reuses the installer's production path. Users trust certs/edmd-codesign.cer once;
-      # that step disappears when SIGNING_MODE flips to 'signpath'.
+      # ---- MSIX: sign with the committed self-signed cert via a secret ----
+      # Reuses the installer's production path. The cert is shipped alongside the release so
+      # users can trust it once (see the README); moving to a publicly-trusted certificate
+      # later would remove that step.
       - name: Build & self-sign MSIX
-        if: env.SIGNING_MODE != 'signpath'
         shell: pwsh
         env:
           PFX_B64: ${{ secrets.SELFSIGN_PFX_BASE64 }}
@@ -84,31 +80,7 @@ jobs:
           ./src/EdMd.Installer/build.ps1 -PfxPath $pfx -PfxPassword $env:PFX_PWD -Version ${{ steps.ver.outputs.msix }}
           Remove-Item $pfx -Force
           Copy-Item "src/EdMd.Installer/Output/EdMd-${{ steps.ver.outputs.msix }}.msix" dist/
-          Copy-Item certs/edmd-codesign.cer dist/   # so users can trust the interim cert
-
-      # ---- MSIX (target): build unsigned, then sign with SignPath ----
-      # Publisher MUST equal the SignPath certificate Subject (repo var SIGNPATH_PUBLISHER).
-      - name: Build unsigned MSIX
-        if: env.SIGNING_MODE == 'signpath'
-        shell: pwsh
-        run: |
-          ./src/EdMd.Installer/build.ps1 -Version ${{ steps.ver.outputs.msix }} -Publisher "${{ vars.SIGNPATH_PUBLISHER }}"
-          Copy-Item "src/EdMd.Installer/Output/EdMd-${{ steps.ver.outputs.msix }}.msix" dist/
-
-      # NOTE (cutover): finalize the input names + artifact-configuration slug against your
-      # SignPath project (https://docs.signpath.io/trusted-build-systems/github). The
-      # project needs an artifact configuration that signs the .msix (and optionally the .exe).
-      - name: Sign with SignPath
-        if: env.SIGNING_MODE == 'signpath'
-        uses: SignPath/github-action-submit-signing-request@v2
-        with:
-          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ vars.SIGNPATH_ORG_ID }}
-          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
-          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
-          artifact-configuration-slug: msix
-          wait-for-completion: true
-          output-artifact-directory: dist
+          Copy-Item certs/edmd-codesign.cer dist/   # so users can trust the signing cert
 
       # ---- Publish ----
       - name: Create GitHub Release (tag builds only)
