@@ -80,6 +80,7 @@ function createEmptyTab(){
   buildChip(tab);
   applyThemeToEditor(tab);
   applyModeToEditor(tab);
+  watchMermaidPreview(tab); // raw mode's preview pane paints its own diagrams
   return tab;
 }
 
@@ -515,13 +516,64 @@ function showMermaidError(source, els, message){
 }
 
 // The read-only element that carries a rendered diagram. Kept out of the editable flow so
-// typing/selection never lands inside it.
-function mermaidWidget(source){
+// typing/selection never lands inside it — but clicking it puts the caret in the code block it
+// belongs to, which is what reveals the source for editing (the block itself is hidden).
+function mermaidWidget(source, view, getPos, TextSelection){
   const el = document.createElement('div');
   el.className = 'edmd-mermaid';
   el.contentEditable = 'false';
+  el.title = 'Click to edit the diagram source';
+  if(view && getPos && TextSelection){
+    el.addEventListener('mousedown', (e) => {
+      e.preventDefault(); // don't let ProseMirror put the selection on the widget itself
+      // The widget sits immediately after its code block, so the position just before it is
+      // inside the block — land the caret there and the source reveals itself.
+      const pos = getPos();
+      if(typeof pos !== 'number') return;
+      const sel = TextSelection.near(view.state.doc.resolve(Math.max(0, pos - 1)), -1);
+      view.dispatch(view.state.tr.setSelection(sel).scrollIntoView());
+      view.focus();
+    });
+  }
   paintMermaid(el, source);
   return el;
+}
+
+// Raw mode's preview pane renders markdown through Toast's own HTML renderer, which has no idea
+// about diagrams — it emits <pre class="lang-mermaid">. Swap that for an empty container tagged
+// with the source; hydrateMermaidPreviews paints it once it's in the DOM. Every other language
+// falls through to `context.origin()`, Toast's default rendering, untouched.
+function mermaidPreviewRenderer(node, context){
+  if((node.info || '').trim().toLowerCase() !== 'mermaid') return context.origin();
+  return [
+    { type: 'openTag', tagName: 'div', outerNewLine: true,
+      classNames: ['edmd-mermaid', 'edmd-mermaid-preview'],
+      attributes: { 'data-mermaid-src': node.literal || '' } },
+    { type: 'closeTag', tagName: 'div', outerNewLine: true },
+  ];
+}
+
+// Paint any preview containers that haven't been painted yet. Driven by a MutationObserver
+// because Toast rebuilds the preview DOM on every keystroke; `data-painted` both marks the ones
+// already handled and stops our own painting from re-triggering the observer in a loop.
+function hydrateMermaidPreviews(root){
+  root.querySelectorAll('.edmd-mermaid-preview:not([data-painted])').forEach((el) => {
+    el.setAttribute('data-painted', '1');
+    paintMermaid(el, el.getAttribute('data-mermaid-src') || '');
+  });
+}
+
+// Watch one tab's preview pane. Toast creates it with the editor, so this is wired up once per
+// tab; the observer is cheap and self-limiting (see data-painted above).
+function watchMermaidPreview(tab){
+  const preview = tab.el.querySelector('.toastui-editor-md-preview');
+  if(!preview) return;
+  hydrateMermaidPreviews(preview);
+  let pending = null;
+  new MutationObserver(() => {
+    clearTimeout(pending);
+    pending = setTimeout(() => hydrateMermaidPreviews(preview), 50);
+  }).observe(preview, { childList: true, subtree: true });
 }
 
 // The editor's theme changed: mermaid bakes colors into the SVG, so re-initialize and repaint
@@ -540,26 +592,47 @@ function refreshMermaidTheme(){
 // A Toast plugin (passed to every editor instance): one ProseMirror plugin that decorates each
 // mermaid code block with the rendered diagram. `context` is how Toast hands plugins the
 // ProseMirror classes — the bundle exposes no other route to them.
+//
+// WYSIWYG shows the *diagram only*: the code block that holds the source is hidden (the
+// `is-mermaid-src` node decoration below drives the CSS), leaving just the rendered picture,
+// the way an image is shown rather than its file path. The source is still reachable — click
+// the diagram, or arrow into the block, and it reveals itself for editing (the `is-editing`
+// class) so the caret is never sitting in something invisible. Raw mode shows the source as
+// markdown always, and its preview pane renders the diagram (see mermaidPreviewRenderer).
 function mermaidPlugin(context){
-  const { Plugin } = context.pmState;
+  const { Plugin, TextSelection } = context.pmState;
   const { Decoration, DecorationSet } = context.pmView;
 
   return {
+    // Raw mode's preview pane: turn a mermaid fence into a container we then paint into.
+    toHTMLRenderers: { codeBlock: mermaidPreviewRenderer },
+
     wysiwygPlugins: [() => {
-      // The decorations prop is consulted on every state change, including plain cursor moves;
-      // remember the last doc so only an actual edit re-walks it.
-      let lastDoc = null, lastSet = DecorationSet.empty;
+      // The decorations prop is consulted on every state change. It depends on the doc AND on
+      // where the selection is (that's what reveals a block for editing), so the memo key is
+      // both — a plain cursor move elsewhere still costs nothing.
+      let lastDoc = null, lastKey = null, lastSet = DecorationSet.empty;
       return new Plugin({
         props: {
           decorations(state){
-            if(state.doc === lastDoc) return lastSet;
-            const widgets = [];
+            const { from, to } = state.selection;
+            const key = from + ':' + to;
+            if(state.doc === lastDoc && key === lastKey) return lastSet;
+            const decos = [];
             state.doc.descendants((node, pos) => {
               if(node.type.name !== 'codeBlock') return true;
               if((node.attrs.language || '').trim().toLowerCase() !== 'mermaid') return false;
               const source = node.textContent;
+              const end = pos + node.nodeSize;
+              // Reveal the source while the caret is inside this block, hide it otherwise —
+              // but only ever hide it when there's something shown in its place. An empty
+              // ```mermaid block has no diagram, so hiding it would make it vanish entirely.
+              const editing = from < end && to > pos;
               if(source.trim()){
-                widgets.push(Decoration.widget(pos + node.nodeSize, () => mermaidWidget(source), {
+                decos.push(Decoration.node(pos, end, {
+                  class: 'is-mermaid-src' + (editing ? ' is-editing' : ''),
+                }));
+                decos.push(Decoration.widget(end, (view, getPos) => mermaidWidget(source, view, getPos, TextSelection), {
                   key: 'mermaid:' + source,  // same source ⇒ reuse the DOM instead of re-rendering
                   side: 1,                   // sits after the block, never inside it
                   ignoreSelection: true,
@@ -567,8 +640,8 @@ function mermaidPlugin(context){
               }
               return false; // a code block's children are just text
             });
-            lastDoc = state.doc;
-            lastSet = DecorationSet.create(state.doc, widgets);
+            lastDoc = state.doc; lastKey = key;
+            lastSet = DecorationSet.create(state.doc, decos);
             return lastSet;
           },
         },
@@ -666,11 +739,12 @@ if(IS_DESKTOP){
     // Export the rendered document. JS builds the standalone HTML (so desktop + browser produce
     // the same file); C# owns the Save dialog + disk write, and — for PDF — renders that HTML in
     // an offscreen WebView2 and prints it to PDF.
-    exportDoc: (kind)=>{
+    exportDoc: async (kind)=>{
       const t = activeTab(); if(!t) return;
-      send({ type: kind === 'pdf' ? 'exportPdf' : 'exportHtml',
-             name: t.name || 'untitled', html: buildExportHtml(exportTitle(t), t.editor.getHTML()) });
       setStatus(kind === 'pdf' ? 'Exporting PDF…' : 'Exporting HTML…');
+      send({ type: kind === 'pdf' ? 'exportPdf' : 'exportHtml',
+             name: t.name || 'untitled',
+             html: buildExportHtml(exportTitle(t), await exportBodyHtml(t)) });
     },
   };
   // Hold off snapshots until C# sends restoreSession, so the empty tab we boot with can't
@@ -718,9 +792,9 @@ if(IS_DESKTOP){
     dirtyChanged: ()=>{}, // browser tracks dirty locally; nothing to mirror
     // No C# here: build the same standalone HTML and hand it to the browser — a download for
     // HTML, a print window (Save as PDF from the print dialog) for PDF.
-    exportDoc(kind){
+    async exportDoc(kind){
       const t = activeTab(); if(!t) return;
-      const html = buildExportHtml(exportTitle(t), t.editor.getHTML());
+      const html = buildExportHtml(exportTitle(t), await exportBodyHtml(t));
       if(kind === 'pdf'){
         const w = window.open('', '_blank');
         if(!w){ setStatus('Allow pop-ups to export PDF', 5000, true); return; }
@@ -985,8 +1059,77 @@ const EXPORT_CSS = `
   .markdown-body table th{background:#f6f8fa;}
   .markdown-body img{max-width:100%;}
   .markdown-body hr{border:none;border-top:1px solid #d8dee4;margin:1.5em 0;}
-  @media print{ .markdown-body{max-width:none;padding:0;} @page{margin:18mm;} }
+  .markdown-body .edmd-mermaid{margin:0 0 1em;text-align:center;}
+  .markdown-body .edmd-mermaid svg{max-width:100%;height:auto;}
+  @media print{ .markdown-body{max-width:none;padding:0;} @page{margin:18mm;}
+    .markdown-body .edmd-mermaid{break-inside:avoid;} }
 `;
+
+// The document body to export. The editor's HTML already carries each diagram (the widget is
+// part of the rendered DOM getHTML() returns) plus the code block holding its source — the
+// export should show what WYSIWYG shows, so the source blocks are dropped and any diagram that
+// hasn't finished rendering is rendered now rather than exported as "Rendering diagram…".
+//
+// Diagrams are re-rendered for export in mermaid's LIGHT theme: EXPORT_CSS is deliberately a
+// light print stylesheet, so a dark-theme diagram would arrive as dark shapes on white paper.
+async function exportBodyHtml(tab){
+  const doc = new DOMParser().parseFromString(tab.editor.getHTML(), 'text/html');
+
+  // Every mermaid source in the document, in order, whichever shape it came out as.
+  const sources = [...doc.querySelectorAll('[data-language="mermaid"]')]
+    .map(el => (el.matches('pre, code') ? el : el.querySelector('code'))?.textContent || '')
+    .filter(s => s.trim());
+
+  let rendered = new Map();
+  if(sources.length){
+    try{ rendered = await renderMermaidForExport(sources); }
+    catch(e){ setStatus('Diagrams could not be rendered for export', 5000, true); }
+  }
+
+  // Replace each rendered widget with a clean container holding the export SVG, and drop the
+  // code blocks that hold the sources (they're the "code behind" the picture).
+  let i = 0;
+  doc.querySelectorAll('.toastui-editor-ww-code-block[data-language="mermaid"]').forEach((block) => {
+    const source = (block.querySelector('code')?.textContent || '').trim();
+    const widget = block.nextElementSibling;
+    const svg = rendered.get(source);
+    if(widget && widget.classList.contains('edmd-mermaid')){
+      widget.className = 'edmd-mermaid';           // drop ProseMirror's own widget class
+      widget.removeAttribute('contenteditable');
+      if(svg) widget.innerHTML = svg;
+    } else if(svg){
+      const holder = doc.createElement('div');
+      holder.className = 'edmd-mermaid';
+      holder.innerHTML = svg;
+      block.parentNode.insertBefore(holder, block.nextSibling);
+    }
+    block.remove();
+    i++;
+  });
+  return doc.body.innerHTML;
+}
+
+// Render a batch of diagram sources with the light export theme, restoring the editor's theme
+// afterwards so the on-screen diagrams keep matching the UI.
+async function renderMermaidForExport(sources){
+  const out = new Map();
+  const mermaid = await loadMermaid();
+  mermaid.initialize({ ...mermaidConfig(), theme: 'default' });
+  try{
+    for(const source of sources){
+      const key = source.trim();
+      if(out.has(key)) continue;
+      try{
+        const { svg } = await mermaid.render('edmd-export-' + (++mermaidSeq), key);
+        out.set(key, svg);
+      }catch(e){ /* a broken diagram just doesn't appear in the export */ }
+    }
+  } finally {
+    mermaid.initialize(mermaidConfig()); // back to the UI's theme
+  }
+  return out;
+}
+
 function buildExportHtml(title, bodyHtml){
   return '<!DOCTYPE html>\n<html lang="en"><head><meta charset="UTF-8">' +
     '<meta name="viewport" content="width=device-width, initial-scale=1">' +

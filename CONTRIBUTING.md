@@ -35,11 +35,16 @@ These come from [`CLAUDE.md`](CLAUDE.md) — PRs that break them will be asked t
 - **Keep the security guards.** Origin pinning to `EdMd.local`, the `e.Source` check before
   disk I/O, the CSP + `script-src 'self'` (no inline `<script>`), and the token-gated loopback
   server. Don't loosen these.
-- **Toast UI Editor stays vendored** under `wwwroot/vendor/toastui/` — never load it from a
-  CDN (it runs in the file-writing WebView2). Upgrades re-vendor the files + bump the version
-  note in `index.html`.
+- **Third-party libraries stay vendored** under `wwwroot/vendor/` — Toast UI Editor and Mermaid
+  are both local copies, never a CDN (they run in the file-writing WebView2). Upgrades
+  re-vendor the files + bump the version note in `index.html`.
+- **EdMd is offline and stays offline.** No CDN, no web font, no telemetry, no update check —
+  and don't loosen the CSP's `img-src`, which deliberately allows no remote origin so an opened
+  document can't report that you opened it. The WebView2 environment is created with background
+  networking off; see the offline section in [`CLAUDE.md`](CLAUDE.md).
 - **Add tests for security-sensitive logic** (see `src/EdMd.Tests/` — `LocalWebServer`,
-  `AtomicFile`). GUI/JS isn't unit-tested; call out manual verification in the PR.
+  `AtomicFile`, `MarkdownFile`, `SessionStore`, `ImageStore`). GUI/JS isn't unit-tested; call
+  out manual verification in the PR.
 - **Never commit secrets.** `certs/*.pfx` and passwords stay out of git (see
   [`.gitignore`](.gitignore) and [`certs/README.md`](certs/README.md)).
 - Don't "fix" the intentional `EdMd.csproj` / `AssemblyName=EdMd` naming — installer and

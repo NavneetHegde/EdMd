@@ -254,8 +254,24 @@ the browser never exposes a file's full path (so the footer shows the name there
   It is deliberately not loaded from a CDN — the editor JS runs in the WebView2 that
   can write files, so a floating CDN version is a code-execution risk. Upgrading
   means re-downloading the three files and bumping the version note in `index.html`.
-- **Mermaid diagrams (`app.js`, "Mermaid diagrams" section):** a ` ```mermaid ` code block keeps
-  its source and gets the rendered SVG shown underneath it, **in WYSIWYG only**. It is a
+- **Mermaid diagrams (`app.js`, "Mermaid diagrams" section).** One source of truth — the
+  ` ```mermaid ` fence in the markdown — shown differently per surface:
+  **WYSIWYG** renders the diagram *instead of* the source (the code block is hidden by the
+  `is-mermaid-src` node decoration + CSS, the way an image shows the picture rather than its
+  path); clicking the diagram, or arrowing into the block, adds `is-editing` and reveals the
+  source so the caret is never inside something invisible — move away and it hides again. An
+  **empty** mermaid block is never hidden (there'd be no diagram in its place, so it would
+  vanish). **Raw mode** shows the fence as markdown, and its **preview** pane renders the diagram
+  (`mermaidPreviewRenderer` swaps Toast's `<pre class="lang-mermaid">` for a container that
+  `hydrateMermaidPreviews` paints; every other language falls through to `context.origin()`, and
+  a per-tab MutationObserver re-hydrates because Toast rebuilds the preview on each keystroke).
+  **Export** (`exportBodyHtml`) drops the source blocks and keeps the diagrams, so the PDF/HTML
+  matches WYSIWYG; diagrams are re-rendered in mermaid's **light** theme first, because
+  `EXPORT_CSS` is a light print stylesheet and a dark-theme SVG would be dark shapes on white
+  paper. Note `editor.getHTML()` returns the rendered ProseMirror DOM, so widgets *are* in it —
+  what export adds is stripping the sources and rendering any diagram still in flight.
+
+  The rendering itself is a
   ProseMirror **widget decoration** (via a Toast plugin's `wysiwygPlugins`), deliberately *not* a
   `wysiwygNodeViews.codeBlock`: node views are keyed by node type, so registering one would
   replace Toast's own code-block view (language chip, editing) for *every* language. Decorations
@@ -268,7 +284,10 @@ the browser never exposes a file's full path (so the footer shows the name there
   Renders are debounced (`MERMAID_DEBOUNCE_MS`) and cached by source, half-typed sources are
   skipped by checking `el.isConnected`, mermaid runs at `securityLevel: 'strict'` with
   `suppressErrorRendering` (a bad diagram gets EdMd's own error box, not mermaid's graphic), and a
-  theme change re-initializes + repaints because mermaid bakes colors into the SVG.
+  theme change re-initializes + repaints because mermaid bakes colors into the SVG. Each paint
+  swaps a fresh id through the cached markup (mermaid scopes the `<style>` it embeds to the render
+  id, so two copies of one diagram would otherwise share a DOM id), and Find/Replace skips
+  `.edmd-mermaid` subtrees — they're rendered output, not document text.
 - **Offline by design — keep it that way.** EdMd never makes a network request: every asset is
   on disk behind the `EdMd.local` virtual host (Toast and Mermaid are vendored, never CDN),
   Toast's `usageStatistics` is `false` (that flag is what gates its google-analytics beacon), the
