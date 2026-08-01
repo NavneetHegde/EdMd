@@ -181,12 +181,18 @@
   .ProseMirror{color:var(--text) !important;line-height:1.7;font-size:15px;
     padding-top:24px;padding-bottom:24px;
     padding-inline:max(40px, calc((100% - var(--read-col, 46rem)) / 2)) !important;}
-  /* Rendered ```mermaid diagrams: a read-only card under the code block that holds the
-     source (see the mermaid section in app.js). Inside .ProseMirror, so it inherits the
-     reading-column padding and the zoom level like any other block. */
-  .edmd-mermaid{margin:-4px 0 16px;padding:12px;border:1px solid var(--border);border-radius:8px;
+  /* Rendered ```mermaid diagrams (see the mermaid section in app.js). Inside .ProseMirror, so
+     it inherits the reading-column padding and the zoom level like any other block. */
+  .edmd-mermaid{margin:0 0 16px;padding:12px;border:1px solid var(--border);border-radius:8px;
     background:var(--panel);overflow-x:auto;text-align:center;
-    color:var(--muted);font-size:13px;user-select:none;}
+    color:var(--muted);font-size:13px;user-select:none;cursor:pointer;}
+  /* WYSIWYG shows the diagram, not the code behind it: the code block holding the source is
+     hidden until the caret is inside it (app.js adds .is-editing), so clicking the diagram or
+     arrowing into the block reveals the source to edit and moving away hides it again. Raw
+     mode is unaffected — that's where the markdown always shows. */
+  .ww-mode .toastui-editor-ww-code-block.is-mermaid-src{display:none;}
+  .ww-mode .toastui-editor-ww-code-block.is-mermaid-src.is-editing{display:block;}
+  .edmd-mermaid-preview{cursor:default;} /* the preview pane has no source to click through to */
   .edmd-mermaid svg{max-width:100%;height:auto;}
   .edmd-mermaid.is-error{text-align:left;white-space:pre-wrap;color:#e5534b;
     font-family:var(--mono);font-size:12px;}
