@@ -42,6 +42,7 @@ function makeEditor(containerEl, tab){
     previewStyle: 'tab',
     hideModeSwitch: true,          // lock to WYSIWYG; remove this line to allow a raw-markdown tab too
     usageStatistics: false,
+    plugins: [mermaidPlugin],      // render ```mermaid blocks as diagrams (WYSIWYG only)
     placeholder: 'Open a markdown file, or just start typing…',
     hooks: {
       // Toast routes BOTH clipboard paste and drag-drop of an image through this one hook. We
@@ -394,6 +395,178 @@ async function insertImage(tab, blob, callback){
   }
 }
 
+// ---- Mermaid diagrams (WYSIWYG) ----------------------------------------------------------
+// A ```mermaid fence keeps its source — nothing here rewrites the document — and gets the
+// rendered diagram shown underneath it as a ProseMirror *widget decoration*. Decorations are
+// view-only, so getMarkdown()/save/snapshot/copy round-trip exactly as before, and Toast's own
+// code-block node view (language chip, editing) keeps working: registering a custom
+// `wysiwygNodeViews.codeBlock` instead would have replaced it for *every* language.
+//
+// mermaid.min.js is ~3.5 MB, so it's fetched the first time a diagram is actually on screen
+// rather than at startup. It's vendored locally for the same reason Toast is — it runs inside
+// the WebView2 that can write files, so a CDN copy would be a code-execution risk.
+const MERMAID_SRC = 'vendor/mermaid/mermaid.min.js';
+const MERMAID_DEBOUNCE_MS = 400;  // let typing settle before re-rendering a diagram
+const MERMAID_CACHE_MAX = 200;    // bound the per-source cache; editing a diagram fills it slowly
+let mermaidLoading = null;        // the one-shot load + initialize promise
+let mermaidSeq = 0;               // unique id per render call (mermaid requires one)
+
+const mermaidTheme = () => (currentTheme && currentTheme.dark ? 'dark' : 'default');
+const mermaidConfig = () => ({
+  startOnLoad: false,
+  // strict: mermaid sanitizes the diagram (no inline HTML, no click handlers) — the source can
+  // come from an untrusted .md. suppressErrorRendering keeps mermaid's own "syntax error"
+  // graphic out of the page; a bad diagram gets our own error box instead.
+  securityLevel: 'strict',
+  suppressErrorRendering: true,
+  theme: mermaidTheme(),
+});
+
+function loadMermaid(){
+  if(mermaidLoading) return mermaidLoading;
+  mermaidLoading = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = MERMAID_SRC;
+    s.onload = () => resolve(window.mermaid);
+    s.onerror = () => reject(new Error('could not load the diagram renderer'));
+    document.head.appendChild(s);
+  }).then((m) => { m.initialize(mermaidConfig()); return m; });
+  return mermaidLoading;
+}
+
+const mermaidCache = new Map();   // diagram source → { svg } or { error }
+const mermaidWanted = new Map();  // diagram source → the Set of elements waiting on it
+let mermaidTimer = null;
+
+// Show what we know about `source` in one container. A miss queues a render and leaves a
+// placeholder; the queue paints the element itself once mermaid answers.
+function paintMermaid(el, source){
+  el._mermaidSource = source;
+  const hit = mermaidCache.get(source);
+  if(hit && hit.svg){
+    el.classList.remove('is-error');
+    el.innerHTML = hit.svg; // mermaid's own output, sanitized by its strict security level
+    return;
+  }
+  if(hit && hit.error){
+    el.classList.add('is-error');
+    el.textContent = hit.error;
+    return;
+  }
+  el.classList.remove('is-error');
+  el.textContent = 'Rendering diagram…';
+  scheduleMermaid(source, el);
+}
+
+function scheduleMermaid(source, el){
+  let waiting = mermaidWanted.get(source);
+  if(!waiting) mermaidWanted.set(source, waiting = new Set());
+  waiting.add(el);
+  clearTimeout(mermaidTimer);
+  mermaidTimer = setTimeout(runMermaidQueue, MERMAID_DEBOUNCE_MS);
+}
+
+function cacheMermaid(source, entry){
+  if(mermaidCache.size >= MERMAID_CACHE_MAX) mermaidCache.clear();
+  mermaidCache.set(source, entry);
+}
+
+async function runMermaidQueue(){
+  const batch = [...mermaidWanted.entries()];
+  mermaidWanted.clear();
+  // Drop the half-typed sources passed through on the way here: ProseMirror has already
+  // detached their widgets, so only still-connected elements are worth rendering.
+  const live = batch.filter(([, els]) => [...els].some(el => el.isConnected));
+  if(!live.length) return;
+
+  let mermaid;
+  try{ mermaid = await loadMermaid(); }
+  catch(e){
+    for(const [source, els] of live) showMermaidError(source, els, 'Diagram renderer unavailable');
+    return;
+  }
+  for(const [source, els] of live){
+    try{
+      const { svg } = await mermaid.render('edmd-mermaid-' + (++mermaidSeq), source);
+      cacheMermaid(source, { svg });
+      for(const el of els) if(el.isConnected) paintMermaid(el, source);
+    }catch(e){
+      // Mermaid's message points at the offending line with a caret, compiler-style — worth
+      // showing whole (the box is monospace + pre-wrap), just capped so it can't fill the page.
+      const msg = (e && e.message) ? String(e.message).trim().slice(0, 500) : 'Invalid diagram';
+      showMermaidError(source, els, msg);
+    }
+  }
+}
+
+function showMermaidError(source, els, message){
+  cacheMermaid(source, { error: message });
+  for(const el of els) if(el.isConnected) paintMermaid(el, source);
+}
+
+// The read-only element that carries a rendered diagram. Kept out of the editable flow so
+// typing/selection never lands inside it.
+function mermaidWidget(source){
+  const el = document.createElement('div');
+  el.className = 'edmd-mermaid';
+  el.contentEditable = 'false';
+  paintMermaid(el, source);
+  return el;
+}
+
+// The editor's theme changed: mermaid bakes colors into the SVG, so re-initialize and repaint
+// every diagram currently on screen. No-op until mermaid has actually been loaded.
+function refreshMermaidTheme(){
+  if(!mermaidLoading) return;
+  mermaidCache.clear();
+  loadMermaid().then((m) => {
+    m.initialize(mermaidConfig());
+    document.querySelectorAll('.edmd-mermaid').forEach((el) => {
+      if(el._mermaidSource) paintMermaid(el, el._mermaidSource);
+    });
+  }).catch(()=>{});
+}
+
+// A Toast plugin (passed to every editor instance): one ProseMirror plugin that decorates each
+// mermaid code block with the rendered diagram. `context` is how Toast hands plugins the
+// ProseMirror classes — the bundle exposes no other route to them.
+function mermaidPlugin(context){
+  const { Plugin } = context.pmState;
+  const { Decoration, DecorationSet } = context.pmView;
+
+  return {
+    wysiwygPlugins: [() => {
+      // The decorations prop is consulted on every state change, including plain cursor moves;
+      // remember the last doc so only an actual edit re-walks it.
+      let lastDoc = null, lastSet = DecorationSet.empty;
+      return new Plugin({
+        props: {
+          decorations(state){
+            if(state.doc === lastDoc) return lastSet;
+            const widgets = [];
+            state.doc.descendants((node, pos) => {
+              if(node.type.name !== 'codeBlock') return true;
+              if((node.attrs.language || '').trim().toLowerCase() !== 'mermaid') return false;
+              const source = node.textContent;
+              if(source.trim()){
+                widgets.push(Decoration.widget(pos + node.nodeSize, () => mermaidWidget(source), {
+                  key: 'mermaid:' + source,  // same source ⇒ reuse the DOM instead of re-rendering
+                  side: 1,                   // sits after the block, never inside it
+                  ignoreSelection: true,
+                }));
+              }
+              return false; // a code block's children are just text
+            });
+            lastDoc = state.doc;
+            lastSet = DecorationSet.create(state.doc, widgets);
+            return lastSet;
+          },
+        },
+      });
+    }],
+  };
+}
+
 // ---- Host abstraction: WebView2 bridge (desktop) OR File System Access API (Chrome) ----
 // The same UI runs in two places: inside the WPF app's WebView2 (where C# owns disk
 // I/O over postMessage) and in a plain Chromium tab (where the File System Access API
@@ -685,6 +858,7 @@ function applyTheme(id){
   document.body.dataset.theme = currentTheme.id;
   themeSelect.value = currentTheme.id;
   for(const tab of tabs) applyThemeToEditor(tab); // every tab's editor tracks the theme
+  refreshMermaidTheme();                          // diagrams bake in colors — repaint them too
   // Let the desktop host darken/lighten the native window title bar to match.
   if(host && host.themeChanged) host.themeChanged(!!currentTheme.dark);
   localStorage.setItem('EdMd-theme', currentTheme.id);

@@ -240,6 +240,21 @@ the browser never exposes a file's full path (so the footer shows the name there
   It is deliberately not loaded from a CDN — the editor JS runs in the WebView2 that
   can write files, so a floating CDN version is a code-execution risk. Upgrading
   means re-downloading the three files and bumping the version note in `index.html`.
+- **Mermaid diagrams (`app.js`, "Mermaid diagrams" section):** a ` ```mermaid ` code block keeps
+  its source and gets the rendered SVG shown underneath it, **in WYSIWYG only**. It is a
+  ProseMirror **widget decoration** (via a Toast plugin's `wysiwygPlugins`), deliberately *not* a
+  `wysiwygNodeViews.codeBlock`: node views are keyed by node type, so registering one would
+  replace Toast's own code-block view (language chip, editing) for *every* language. Decorations
+  are view-only, so `getMarkdown()` — and therefore save, session snapshot, copy and the browser
+  handoff — round-trips the document byte-for-byte. Toast hands plugins the ProseMirror classes
+  (`Plugin`, `Decoration`, `DecorationSet`) on the plugin `context`; there is no other route to
+  them from the bundle. Mermaid (v11.16.0) is **vendored** under `wwwroot/vendor/mermaid/` for the
+  same reason Toast is, but it is ~3.5 MB, so `loadMermaid()` injects the `<script>` lazily the
+  first time a diagram is on screen rather than at startup (`script-src 'self'` still covers it).
+  Renders are debounced (`MERMAID_DEBOUNCE_MS`) and cached by source, half-typed sources are
+  skipped by checking `el.isConnected`, mermaid runs at `securityLevel: 'strict'` with
+  `suppressErrorRendering` (a bad diagram gets EdMd's own error box, not mermaid's graphic), and a
+  theme change re-initializes + repaints because mermaid bakes colors into the SVG.
 - **Security model:** the WebView2 is pinned to the `EdMd.local` origin.
   `NavigationStarting`/`NewWindowRequested` cancel any off-origin navigation and open
   such links in the OS browser; `OnWebMessageReceived` checks `e.Source` before

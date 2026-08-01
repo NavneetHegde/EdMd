@@ -25,6 +25,9 @@
      class does nothing and the toolbar icons render dark-on-dark (invisible). -->
 <link rel="stylesheet" href="vendor/toastui/toastui-editor-dark.min.css" />
 <script src="vendor/toastui/toastui-editor-all.min.js"></script>
+<!-- Mermaid (v11.16.0) is vendored under vendor/mermaid/ for the same reason, but is NOT
+     loaded here: it's ~3.5 MB, so app.js injects the <script> lazily the first time a
+     ```mermaid block is on screen (see loadMermaid). script-src 'self' still covers it. -->
 <style>
   :root{
     --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
@@ -173,6 +176,15 @@
   .ProseMirror{color:var(--text) !important;line-height:1.7;font-size:15px;
     padding-top:24px;padding-bottom:24px;
     padding-inline:max(40px, calc((100% - var(--read-col, 46rem)) / 2)) !important;}
+  /* Rendered ```mermaid diagrams: a read-only card under the code block that holds the
+     source (see the mermaid section in app.js). Inside .ProseMirror, so it inherits the
+     reading-column padding and the zoom level like any other block. */
+  .edmd-mermaid{margin:-4px 0 16px;padding:12px;border:1px solid var(--border);border-radius:8px;
+    background:var(--panel);overflow-x:auto;text-align:center;
+    color:var(--muted);font-size:13px;user-select:none;}
+  .edmd-mermaid svg{max-width:100%;height:auto;}
+  .edmd-mermaid.is-error{text-align:left;white-space:pre-wrap;color:#e5534b;
+    font-family:var(--mono);font-size:12px;}
   /* Zoom the WHOLE editor content area uniformly — text, headings, code, images,
      tables, spacing — not just the base font. `zoom` reflows so it always fills
      100% of the editor area at any level. Applies to WYSIWYG surface AND preview. */
