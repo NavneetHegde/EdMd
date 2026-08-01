@@ -119,6 +119,43 @@ public class ImageStoreTests
             ImageStore.RelativeLink("img-20260712-153000-1a2b3c4d.png"));
     }
 
+    [Fact]
+    public void MimeForExtension_maps_the_allowlisted_types()
+    {
+        Assert.Equal("image/png", ImageStore.MimeForExtension("png"));
+        Assert.Equal("image/jpeg", ImageStore.MimeForExtension("JPG"));
+        Assert.Equal("image/gif", ImageStore.MimeForExtension("gif"));
+        Assert.Equal("image/webp", ImageStore.MimeForExtension("webp"));
+        Assert.Equal("application/octet-stream", ImageStore.MimeForExtension("svg"));
+    }
+
+    [Fact]
+    public void ResolveAssetRequest_resolves_a_link_inside_the_documents_assets_folder()
+    {
+        string dir = Path.Combine("C:", "notes");
+        Assert.Equal(
+            Path.Combine("C:", "notes", "assets", "img-20260712-153000-1a2b3c4d.png"),
+            ImageStore.ResolveAssetRequest(dir, "assets/img-20260712-153000-1a2b3c4d.png"));
+    }
+
+    [Theory]
+    // Anything that escapes the document's own assets/ folder, or isn't an allowlisted image,
+    // must be refused — this is the gate that stops the asset origin reading arbitrary files.
+    [InlineData("assets/../../secret.png")]
+    [InlineData(@"assets/..\..\secret.png")]
+    [InlineData("../assets/secret.png")]
+    [InlineData("secret.png")]              // next to the doc, but outside assets/
+    [InlineData("assets/notes.md")]         // inside assets/, but not an image
+    [InlineData("assets/evil.svg")]         // deliberately not in the allowlist
+    [InlineData("C:/Windows/win.ini")]      // rooted path: Path.Combine would discard the root
+    [InlineData("assets/")]
+    [InlineData("")]
+    [InlineData(null)]
+    public void ResolveAssetRequest_refuses_anything_outside_the_allowlist_or_folder(string? urlPath)
+    {
+        Assert.Null(ImageStore.ResolveAssetRequest(Path.Combine("C:", "notes"), urlPath));
+    }
+
     // Turn a simple "*-hash.ext" glob into an anchored regex so the test can assert both filenames
     // match the one dedupe pattern.
     private static Regex WildcardToRegex(string glob) =>

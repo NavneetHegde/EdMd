@@ -97,6 +97,13 @@ public partial class MainWindow : Window
             Browser.CoreWebView2.SetVirtualHostNameToFolderMapping(
                 "EdMd.local", wwwroot, CoreWebView2HostResourceAccessKind.Allow);
 
+            // Serve each open document's assets/ images from one fixed origin (see AssetsBaseFor).
+            // Registered here, BEFORE the navigation — a per-document virtual host mapped later
+            // would not apply to the already-loaded page (see the comment on AssetsBaseFor).
+            Browser.CoreWebView2.AddWebResourceRequestedFilter(
+                AssetsOrigin + "/*", CoreWebView2WebResourceContext.Image);
+            Browser.CoreWebView2.WebResourceRequested += OnAssetRequested;
+
             Browser.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
             Browser.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
             // Keep the app pinned to its own origin; send anything else to the OS browser.
@@ -669,14 +676,25 @@ public partial class MainWindow : Window
 
     // The WebView2 is pinned to https://EdMd.local (mapped to wwwroot), so a relative image link
     // like assets/img-….png would resolve against wwwroot and 404 in the live editor. To make a
-    // document's own images render, we map its folder to a distinct per-folder virtual host and
-    // hand JS that host as an absolute base; JS shows images from it while keeping the on-disk link
-    // relative (portable). Only image subresources use it — CSP img-src allows any https: host, and
+    // document's own images render, each document folder gets an id under one fixed asset origin,
+    // and JS is handed "https://edmd-assets.local/<id>/" as its base; JS shows images from there
+    // while keeping the on-disk link relative (portable). CSP img-src allows https:, and
     // NavigationStarting still blocks top-level navigation to anything but EdMd.local.
-    private readonly HashSet<string> _assetHosts = new(StringComparer.OrdinalIgnoreCase);
+    //
+    // Why interception and not SetVirtualHostNameToFolderMapping per folder: a mapping registered
+    // AFTER the page has navigated does not reach the already-loaded document (it only takes effect
+    // once some later CoreWebView2 call happens to flush it), and document folders are only known
+    // once a file is opened/saved — i.e. always after navigation. So every pasted image rendered
+    // broken. The filter+handler below is registered before the navigation and is deterministic.
+    private const string AssetsOrigin = "https://edmd-assets.local";
 
-    // The absolute https base ("https://<host>/") for a document's directory, mapping the folder to
-    // a virtual host on first use. Returns "" if there's no directory to map (defensive).
+    // Folder id → the document directory it stands for. Ids are content-derived, so the same folder
+    // always gets the same id (URLs stay stable across a session) and can't be guessed for a folder
+    // the user never opened.
+    private readonly Dictionary<string, string> _assetFolders = new(StringComparer.OrdinalIgnoreCase);
+
+    // The absolute base ("https://edmd-assets.local/<id>/") for a document's directory, registering
+    // the folder on first use. Returns "" if there's no directory (defensive).
     private string AssetsBaseFor(string docPath)
     {
         string? dir;
@@ -685,25 +703,55 @@ public partial class MainWindow : Window
         if (string.IsNullOrEmpty(dir))
             return "";
 
-        // Host derived from the (case-folded) folder path, so the same folder always maps to the
-        // same host and an attacker can't guess another document's host. Prefixed with a letter so
-        // the leading label is never a digit.
-        string host = "a" + ShortHash(dir.ToLowerInvariant()) + ".edmdassets.local";
-        if (_assetHosts.Add(host))
+        string id = ShortHash(dir.ToLowerInvariant());
+        _assetFolders[id] = dir;
+        return AssetsOrigin + "/" + id + "/";
+    }
+
+    // Serve a document's own images (the assets/ folder next to it) for the editor surface.
+    // Everything security-sensitive — that the path stays inside <doc folder>/assets and names an
+    // allowlisted image type — is the unit-tested ImageStore.ResolveAssetRequest; anything else
+    // gets a 404 rather than falling through to the network.
+    private void OnAssetRequested(object? sender, CoreWebView2WebResourceRequestedEventArgs e)
+    {
+        try
         {
+            var uri = new Uri(e.Request.Uri);
+            // "/<folder id>/assets/<file>" → the id and the rest of the path.
+            string path = Uri.UnescapeDataString(uri.AbsolutePath).TrimStart('/');
+            int slash = path.IndexOf('/');
+            string? dir = null;
+            if (slash > 0)
+                _assetFolders.TryGetValue(path.Substring(0, slash), out dir);
+
+            string? file = dir == null
+                ? null
+                : ImageStore.ResolveAssetRequest(dir, path.Substring(slash + 1));
+
+            if (file == null || !File.Exists(file))
+            {
+                e.Response = Browser.CoreWebView2.Environment.CreateWebResourceResponse(
+                    null, 404, "Not Found", "");
+                return;
+            }
+
+            var stream = File.OpenRead(file);
+            e.Response = Browser.CoreWebView2.Environment.CreateWebResourceResponse(
+                stream, 200, "OK",
+                "Content-Type: " + ImageStore.MimeForExtension(Path.GetExtension(file).TrimStart('.')) + "\r\n" +
+                "Cache-Control: no-cache");
+        }
+        catch (Exception ex)
+        {
+            // A locked/vanished file must not take the app down — report it as a 404.
+            Log.Write("Asset request failed for " + e.Request.Uri + ": " + ex);
             try
             {
-                Browser.CoreWebView2.SetVirtualHostNameToFolderMapping(
-                    host, dir, CoreWebView2HostResourceAccessKind.Allow);
+                e.Response = Browser.CoreWebView2.Environment.CreateWebResourceResponse(
+                    null, 404, "Not Found", "");
             }
-            catch (Exception ex)
-            {
-                // A missing/renamed folder (e.g. a recovered tab whose file is gone) just won't map;
-                // the image shows broken, which is the honest outcome. Don't crash over it.
-                Log.Write("SetVirtualHostNameToFolderMapping failed for " + dir + ": " + ex);
-            }
+            catch { /* the request is already gone — nothing to answer */ }
         }
-        return "https://" + host + "/";
     }
 
     // 16 hex chars of SHA-256 — enough to make per-folder host collisions negligible.

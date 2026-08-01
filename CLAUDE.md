@@ -58,7 +58,8 @@ MIME, 404/405, the `/__session` token gate, and path-traversal blocking), `Atomi
 extension gate for command-line opens and single-instance forwarding), `SessionStore`
 (the session-restore serialize/round-trip + tolerant parse of a corrupt session file), and
 `ImageStore` (the image-paste MIME→ext allowlist, content-addressed filename + hash dedupe,
-and relative-link helpers). GUI/bridge code (tabs,
+relative-link helpers, and `ResolveAssetRequest` — the containment/allowlist gate the asset
+origin serves images through). GUI/bridge code (tabs,
 single-instance plumbing, the WebView2 bridge) and the front-end JS are not covered. There is no linter or CI. `EdMd.slnx` at the repo root is the (XML) solution
 file (now lists both projects). Note the project file is `EdMd.csproj` but `AssemblyName` is
 `EdMd`, so the built/published binary is **`EdMd.exe`** — installer and
@@ -160,9 +161,20 @@ HTTP server or other IPC. (`LocalWebServer` exists only for the browser handoff,
   **Rendering (the non-obvious part):** the editor page is served from `EdMd.local` (mapped to
   `wwwroot`), so a *relative* `assets/…` link would 404 in the live WYSIWYG surface — Toast renders
   images from the node's `imageUrl`, which is *also* what `getMarkdown` serializes, so there's no
-  separate "display src." So C# maps each document's folder to a **per-folder virtual host**
-  (`AssetsBaseFor` → `a<hash>.edmdassets.local`, allowed by CSP's `img-src https:`) and hands JS
-  that absolute base as `assetsBase` on `fileOpened`/`saved`/`restoreSession`/`imageSaved`. JS keeps
+  separate "display src." So C# serves each document's images from **one fixed asset origin**,
+  `https://edmd-assets.local/<folder id>/` (`AssetsBaseFor`, allowed by CSP's `img-src https:`),
+  and hands JS that absolute base as `assetsBase` on
+  `fileOpened`/`saved`/`restoreSession`/`imageSaved`. That origin is **not** a virtual host
+  mapping: `MainWindow_Loaded` registers an `AddWebResourceRequestedFilter` +
+  `WebResourceRequested` handler (`OnAssetRequested`) *before* the navigation, and the handler
+  streams the file off disk. **Don't "simplify" this back to a per-folder
+  `SetVirtualHostNameToFolderMapping`** — a mapping added *after* the page has navigated does not
+  reach the already-loaded document (it only starts working if some later CoreWebView2 call happens
+  to flush it), and document folders are only known once a file is opened/saved, i.e. always after
+  navigation; that was the bug where every pasted image rendered broken. `_assetFolders` maps the
+  id (a hash of the folder path) back to the directory, and `ImageStore.ResolveAssetRequest` is the
+  gate that keeps a request inside that document's own `assets/` folder and on the image
+  allowlist — anything else gets a 404. JS keeps
   the editor content **absolute** (so images render) but converts to/from **relative** at every
   persistence boundary via `absolutizeAssets`/`relativizeAssets` (anchored on the `](assets/`
   token) — `tabMarkdown(tab)` is the relativised markdown used for save, snapshot, copy, and the
