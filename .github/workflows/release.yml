@@ -82,6 +82,23 @@ jobs:
           Copy-Item "src/EdMd.Installer/Output/EdMd-${{ steps.ver.outputs.msix }}.msix" dist/
           Copy-Item certs/edmd-codesign.cer dist/   # so users can trust the signing cert
 
+      # ---- SBOM (CycloneDX 1.7) ----
+      # Ships with the release so the published binaries can be audited for vulnerable or
+      # awkwardly-licensed dependencies. Written into dist/ so it rides along with the
+      # existing `files: dist/*` upload (and the dry-run artifact upload below).
+      # NOTE: --spec-version picks the CycloneDX version; the similar-looking -sv is
+      # --set-version (the metadata component version). Don't swap them.
+      - name: Install CycloneDX tool
+        run: dotnet tool install --global CycloneDX
+
+      - name: Generate SBOM
+        shell: pwsh
+        run: |
+          dotnet CycloneDX EdMd.slnx --spec-version 1.7 --output-format Json `
+            --set-name EdMd --set-version ${{ steps.ver.outputs.semver }} --output sbom
+          if (-not (Test-Path sbom/bom.json)) { throw "CycloneDX produced no bom.json." }
+          Copy-Item sbom/bom.json "dist/EdMd-${{ steps.ver.outputs.semver }}-sbom.cdx.json"
+
       # ---- Publish ----
       - name: Create GitHub Release (tag builds only)
         if: github.event_name == 'push'
