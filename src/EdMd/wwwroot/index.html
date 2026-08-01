@@ -160,7 +160,10 @@
   /* Re-skin Toast UI Editor to track the theme variables, and hide the raw-markdown
      mode tab since we want pure inline (WYSIWYG) editing, not a mode switch. */
   .toastui-editor-defaultUI{border:none;}
-  .toastui-editor-defaultUI-toolbar{background:var(--panel) !important;border-bottom:1px solid var(--border) !important;}
+  /* Centre the formatting buttons over the (centred) reading column instead of letting
+     them hug the left edge. The toolbar is already flex, so this is just its main axis. */
+  .toastui-editor-defaultUI-toolbar{background:var(--panel) !important;border-bottom:1px solid var(--border) !important;
+    justify-content:center;}
   .toastui-editor-mode-switch{display:none !important;}
   .toastui-editor-main{background:var(--bg) !important;}
   /* Center the text in a readable column (see --read-col / the reading-width control).
