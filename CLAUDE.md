@@ -60,7 +60,10 @@ extension gate for command-line opens and single-instance forwarding), `SessionS
 `ImageStore` (the image-paste MIME→ext allowlist, content-addressed filename + hash dedupe,
 relative-link helpers, and `ResolveAssetRequest` — the containment/allowlist gate the asset
 origin serves images through). GUI/bridge code (tabs,
-single-instance plumbing, the WebView2 bridge) and the front-end JS are not covered. There is no linter or CI. `EdMd.slnx` at the repo root is the (XML) solution
+single-instance plumbing, the WebView2 bridge) and the front-end JS are not covered. There is no
+linter, but CI does run: `.github/workflows/ci.yml` (`build-test`) restores/builds/tests
+`EdMd.slnx` in Release on `windows-latest` for every push to `main` and every PR;
+`release.yml` is the other workflow. `EdMd.slnx` at the repo root is the (XML) solution
 file (now lists both projects). Note the project file is `EdMd.csproj` but `AssemblyName` is
 `EdMd`, so the built/published binary is **`EdMd.exe`** — installer and
 manifest references depend on that name; don't "fix" the mismatch.
