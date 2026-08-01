@@ -255,6 +255,24 @@ the browser never exposes a file's full path (so the footer shows the name there
   skipped by checking `el.isConnected`, mermaid runs at `securityLevel: 'strict'` with
   `suppressErrorRendering` (a bad diagram gets EdMd's own error box, not mermaid's graphic), and a
   theme change re-initializes + repaints because mermaid bakes colors into the SVG.
+- **Offline by design — keep it that way.** EdMd never makes a network request: every asset is
+  on disk behind the `EdMd.local` virtual host (Toast and Mermaid are vendored, never CDN),
+  Toast's `usageStatistics` is `false` (that flag is what gates its google-analytics beacon), the
+  only `fetch` in `app.js` is the same-origin `/__session` handoff, and `LocalWebServer` binds
+  `IPAddress.Loopback`. The CSP allows **no remote origin at all** — in particular `img-src` lists
+  only `'self' data: blob: https://edmd-assets.local`, so an opened `.md` cannot pull a remote
+  image (a tracking pixel would otherwise report that you opened the document). Adding a CDN
+  `<script>`/`<link>`, a web font, or a permissive `img-src` would undo this.
+  The *Chromium engine* underneath is the other half: `CreateOfflineEnvironment` passes
+  `AdditionalBrowserArguments` (`--disable-background-networking`, `--disable-component-update`,
+  `--disable-domain-reliability`, `--no-pings`, `--host-resolver-rules=…~NOTFOUND`, a
+  `--disable-features=…` list) plus `IsCustomCrashReportingEnabled` and
+  `AllowSingleSignOnUsingOSPrimaryAccount=false`, instead of the default environment. Measured: a
+  bare WebView2 host opens 3 background connections to Microsoft; EdMd with these options opens 2.
+  The residual pair is the runtime's own Windows-account/SSO probe (`login.live.com`,
+  `login.microsoftonline.com`) made through the **OS** stack, not Chromium's — no in-process
+  switch stops it, and it carries no document data. Blocking it takes a WebView2/Edge policy or a
+  firewall rule, outside the app.
 - **Security model:** the WebView2 is pinned to the `EdMd.local` origin.
   `NavigationStarting`/`NewWindowRequested` cancel any off-origin navigation and open
   such links in the OS browser; `OnWebMessageReceived` checks `e.Source` before

@@ -8,9 +8,14 @@
      means injected inline scripts / on* handlers can't run even if they survive rendering;
      the app's own JS lives in app.js (no inline script). style-src keeps 'unsafe-inline'
      because the theming relies on an inline <style> block + inline style attributes, which
-     are not a script-execution vector. img-src is permissive so document images still render;
-     connect-src 'self' allows the browser build's /__session fetch. No 'unsafe-eval'. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+     are not a script-execution vector. connect-src 'self' allows the browser build's /__session
+     fetch. No 'unsafe-eval'.
+     img-src deliberately lists NO remote origin: EdMd is an offline editor, and a permissive
+     img-src would let any opened .md fetch a remote image — i.e. announce to that server that
+     you opened the document (IP, timing), which is how tracking pixels work. Local images
+     (data:/blob: pastes, and the desktop build's per-document assets host) still render; a
+     document that links a picture on the web shows a broken image instead. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://edmd-assets.local; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <!-- Never send a Referer to external resources (e.g. a document's remote <img>), so the
      page URL — which briefly carries the ?session token in the browser handoff — can't leak. -->
 <meta name="referrer" content="no-referrer">
