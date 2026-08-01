@@ -1,8 +1,10 @@
-# MD Editor (.NET / WPF)
+# EdMd (.NET / WPF)
 
 A native Windows app (WPF host + WebView2 for the editor UI) that opens and saves
-`.md` files directly on disk, with the same split-pane editor/preview as the
-browser version.
+`.md` files directly on disk. The whole UI — tab strip, toolbar, editor, footer — is the
+HTML/CSS/JS under `wwwroot/`; the C# side owns the window and the disk I/O the browser
+sandbox can't do. See the [root README](../../README.md) for the feature list and
+[`CLAUDE.md`](../../CLAUDE.md) for how the C# ⇄ JS bridge fits together.
 
 ## Requirements to build
 
@@ -101,3 +103,11 @@ find `EdMd.exe` (Browse to the published exe if not listed) → "Always use this
   would be code-execution-with-disk-access risk. This also makes the app work fully
   offline. To upgrade, re-download the three files from `uicdn.toast.com` and bump
   the version note in `index.html`.
+- **Mermaid** (v11) is vendored the same way under `wwwroot/vendor/mermaid/`, for the same
+  reason — but it's ~3.5 MB, so `app.js` injects its `<script>` the first time a diagram is
+  actually on screen rather than at startup. Upgrading is one file plus the version note in
+  `index.html`.
+- **The app makes no network requests**, and the WebView2 it hosts is created with an
+  explicitly offline environment (background networking, component updates, crash reporting
+  and autofill services off). If you add a feature, don't reach for a CDN or a web font — see
+  the offline section in [`CLAUDE.md`](../../CLAUDE.md).

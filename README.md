@@ -13,6 +13,11 @@ skills, `CLAUDE.md` files, PRs, and specs — with a live token/word/char counte
 middle-click to close, or open/select many files at once). Double-clicking a `.md` in Explorer
 opens it as a new tab in the running window instead of launching a second copy.
 
+**Works offline, stays offline.** Everything ships with the app — the editor and the diagram
+renderer are vendored, not loaded from a CDN — and the page's Content-Security-Policy allows no
+remote origin at all, so opening a document never tells anyone you opened it. See
+[Security & design](#security--design).
+
 > <img width="1520" height="793" alt="image" src="https://github.com/user-attachments/assets/519be67c-332c-439e-aa3b-2757c6052dbc" />
 
 
@@ -20,6 +25,41 @@ In Browser
 
 <img width="1920" height="1032" alt="image" src="https://github.com/user-attachments/assets/86bb2144-1458-46c8-8df5-f960ce7ab9f2" />
 
+
+## Features
+
+**Writing**
+
+- **WYSIWYG by default**, with a **Raw** toggle for the markdown source — and a Preview tab
+  next to it when you want to see the rendered result while editing the source.
+- **Mermaid diagrams.** A ` ```mermaid ` block is shown as the *diagram* in WYSIWYG (click it to
+  edit the source behind it), as markdown in Raw, and rendered in the preview. Flowcharts,
+  sequence, gitGraph, pie — whatever Mermaid supports; a broken diagram gets a plain error box
+  instead of a crash.
+- **Paste or drag in an image.** In a saved document the bytes are written to a sibling
+  `assets/` folder and linked relatively (`![](assets/img-….png)`), so the `.md` stays portable
+  and renders on GitHub. Identical images are stored once. An unsaved document embeds the image
+  inline as a data URI instead, so nothing is written next to a file that doesn't exist yet.
+- **Find & replace** with live highlighting, case and regex options.
+- **Live counter** in the footer: `~tokens · words · chars` — handy when writing for an LLM.
+
+**Documents**
+
+- **Tabs**, multi-select open, and single-instance file associations (above).
+- **Session restore & crash recovery.** Reopening picks up the tabs you had, including unsaved
+  buffers.
+- **Export to PDF or HTML** — a clean, self-contained, print-friendly document. Diagrams are
+  included as pictures.
+- **Copy as Markdown / plain text** — the whole document to the clipboard in one click, ready
+  to paste into a chat.
+- **Open in Browser** — hands the current document to Chrome/Edge running the same editor.
+- Encoding and line endings (UTF-8/BOM, CRLF/LF) are preserved on save, writes are atomic, and
+  an external change to an open file is detected before it can be overwritten.
+
+**Appearance**
+
+- Twelve themes (light and dark), zoom, and an adjustable reading-column width. The native
+  title bar follows the theme.
 
 ## Install
 
@@ -34,17 +74,16 @@ in-place upgrades.
 Add-AppxPackage .\EdMd-<version>.msix
 ```
 
-> **Interim trust step (self-signed builds only).** Until public signing via SignPath is
-> live, releases are signed with a self-signed certificate, so Windows needs to trust it
-> once. Download `edmd-codesign.cer` from the same release and run, in an **elevated**
-> PowerShell:
+> **Interim trust step.** Releases are currently signed with a self-signed certificate, so
+> Windows needs to trust it once before the MSIX will install. Download `edmd-codesign.cer`
+> from the same release and run, in an **elevated** PowerShell:
 >
 > ```powershell
 > Import-Certificate -FilePath .\edmd-codesign.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
 > Import-Certificate -FilePath .\edmd-codesign.cer -CertStoreLocation Cert:\LocalMachine\Root
 > ```
 >
-> This step **goes away** once builds are signed by SignPath (a publicly-trusted cert).
+> This step goes away if builds move to a publicly-trusted certificate.
 
 ### Portable executable (no install)
 
@@ -118,24 +157,35 @@ the run, no Release).
 
 ### Signing
 
-A repo variable `SIGNING_MODE` selects the branch:
-
-| Mode | Cert | User trust step | Secrets / variables |
-|------|------|-----------------|---------------------|
-| `selfsigned` (interim) | committed `CN=EdMd` self-signed | yes (import `.cer` once) | `SELFSIGN_PFX_BASE64`, `SELFSIGN_PFX_PASSWORD` |
-| `signpath` (target) | SignPath Foundation OV (publicly trusted) | no | `SIGNPATH_API_TOKEN`; vars `SIGNPATH_ORG_ID`, `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_POLICY_SLUG`, `SIGNPATH_PUBLISHER` |
+Releases are signed with a **self-signed** `CN=EdMd` certificate (`SIGNING_MODE=selfsigned`,
+secrets `SELFSIGN_PFX_BASE64` / `SELFSIGN_PFX_PASSWORD`), which is why the MSIX needs the
+one-time trust step [above](#msix-installer-recommended).
 
 The private key (`certs/*.pfx`) is **never committed** (see [`.gitignore`](.gitignore)); CI
-reads it from a secret. See [`certs/README.md`](certs/README.md).
-
-> Free code signing provided by [SignPath.io](https://signpath.io), certificate by
-> [SignPath Foundation](https://signpath.org). _(Applies once `SIGNING_MODE=signpath`.)_
+reads it from a secret. See [`certs/README.md`](certs/README.md) and, for the full release
+process, [`RELEASING.md`](RELEASING.md).
 
 ## Security & design
 
-Origin-pinned WebView2, a CSP behind Toast's sanitizer, atomic file writes, a token-gated
-loopback handoff for "Open in Browser", and encoding/line-ending preservation. Details in
-[`CLAUDE.md`](CLAUDE.md) and [`docs/production-readiness-review.md`](docs/production-readiness-review.md).
+A markdown file you open is untrusted input, and the WebView2 rendering it can also write to
+disk — so the boundary between them is where the design effort went:
+
+- **Origin-pinned WebView2.** The UI is served from a virtual host; navigation anywhere else is
+  cancelled and opened in your normal browser instead, and messages from any other origin are
+  ignored before they can touch disk.
+- **CSP behind Toast's sanitizer.** No inline script, no `unsafe-eval`, and **no remote origin**
+  — including images, so a document can't phone home with a tracking pixel.
+- **No network.** The app makes no requests of its own; the browser engine it embeds is started
+  with background networking, component updates, crash reporting and telemetry switched off.
+  One caveat, measured and documented in [`CLAUDE.md`](CLAUDE.md): the WebView2 runtime still
+  makes a Windows-account probe of its own that no in-process setting reaches.
+- **Careful writes.** Atomic saves, preserved encoding/line endings, an external-change guard,
+  and a size- and type-limited path for pasted images that can't escape the document's folder.
+- **Token-gated loopback** for the "Open in Browser" handoff, so nothing else on localhost can
+  read your document.
+
+Details in [`CLAUDE.md`](CLAUDE.md) and
+[`docs/production-readiness-review.md`](docs/production-readiness-review.md).
 
 ## License
 

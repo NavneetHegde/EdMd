@@ -1,8 +1,17 @@
 # EdMd — Image Paste & Drag-and-Drop (design)
 
-Status: **proposed** (not yet implemented). This document specifies the feature end-to-end
-so it can be built in one pass, following the same "wire both sides of the bridge" contract
-as the existing open/save/export actions.
+Status: **shipped.** Kept as the record of the design; the implementation is described in
+[`CLAUDE.md`](../CLAUDE.md) ("Image paste / drag-drop"), which is the current source of truth.
+
+> **One prediction below was wrong, and it caused a bug.** The security section claims the CSP
+> "already allows" the stored image to render and that "no new origin is introduced" — that
+> isn't true. The editor page is served from the `EdMd.local` virtual host, so a *relative*
+> `assets/…` link resolves against `wwwroot` and 404s: every pasted image rendered broken while
+> the file itself was written correctly. Fixing it did introduce a new origin —
+> `https://edmd-assets.local/<folder id>/`, served by a `WebResourceRequested` handler
+> registered *before* the WebView2 navigates (a virtual-host mapping added afterwards doesn't
+> reach the loaded document) — and `img-src` names it explicitly. The `.md` on disk still keeps
+> relative links; JS converts at every persistence boundary.
 
 ## Context
 
